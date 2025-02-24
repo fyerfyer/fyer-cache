@@ -14,6 +14,35 @@ type LockOption struct {
 	RetryTimes int
 	// 是否阻塞等待
 	BlockWaiting bool
+	// 最大重试次数
+	MaxRetries int
+	// 重试等待时间增长策略
+	BackoffStrategy BackoffStrategy
+}
+
+// BackoffStrategy 重试等待时间增长策略接口
+type BackoffStrategy interface {
+	NextBackoff(retryCount int) time.Duration
+}
+
+// ExponentialBackoff 指数重试时间增长策略
+type ExponentialBackoff struct {
+	InitialInterval time.Duration
+	MaxInterval     time.Duration
+	Multiplier      float64
+}
+
+// NextBackoff 指数计算下一次重试等待时间
+func (e *ExponentialBackoff) NextBackoff(retryCount int) time.Duration {
+	interval := float64(e.InitialInterval)
+	for i := 0; i < retryCount; i++ {
+		interval = interval * e.Multiplier
+		if interval > float64(e.MaxInterval) {
+			return e.MaxInterval
+		}
+	}
+
+	return time.Duration(interval)
 }
 
 // Option 定义选项函数类型
