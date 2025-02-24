@@ -42,6 +42,7 @@ func (l *RedisLock) Lock(ctx context.Context) error {
 		return ferr.ErrLockAlreadyHeld
 	}
 
+	retryCnt := 0
 	for {
 		// 尝试获取锁
 		success, err := l.tryAcquire(ctx)
@@ -58,6 +59,21 @@ func (l *RedisLock) Lock(ctx context.Context) error {
 			}
 		}
 
+		// 检查重试次数
+		if retryCnt > l.options.RetryTimes {
+			return ferr.ErrLockAcquireFailed
+		}
+
+		retryCnt++
+
+		// 计算下一次重试时间
+		var waitTime time.Duration
+		if l.options.BackoffStrategy != nil {
+			waitTime = l.options.BackoffStrategy.NextBackoff(retryCnt)
+		} else {
+			waitTime = l.options.RetryInterval
+		}
+
 		// 如果不需要阻塞等待，直接返回error
 		if !l.options.BlockWaiting {
 			return ferr.ErrLockAcquireFailed
@@ -69,7 +85,7 @@ func (l *RedisLock) Lock(ctx context.Context) error {
 			return ctx.Err()
 
 		// 当到了重试的时间间隔，重新重试
-		case <-time.After(l.options.RetryInterval):
+		case <-time.After(waitTime):
 			continue
 		}
 	}
