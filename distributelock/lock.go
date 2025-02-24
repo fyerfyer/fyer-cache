@@ -2,15 +2,16 @@ package distributelock
 
 import (
 	"context"
+	"time"
+
 	"github.com/fyerfyer/fyer-cache/internal/ferr"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
-	"time"
 )
 
 // RedisLock 基于Redis的分布式锁
 type RedisLock struct {
-	client   *redis.Client
+	client   redis.Cmdable
 	key      string
 	val      string
 	options  *LockOption
@@ -21,7 +22,7 @@ type RedisLock struct {
 }
 
 // NewRedisLock 创建RedisLock实例
-func NewRedisLock(client *redis.Client, key string, opts ...Option) *RedisLock {
+func NewRedisLock(client redis.Cmdable, key string, opts ...Option) *RedisLock {
 	options := DefaultOption()
 	for _, opt := range opts {
 		opt(options)
@@ -64,8 +65,6 @@ func (l *RedisLock) Lock(ctx context.Context) error {
 			return ferr.ErrLockAcquireFailed
 		}
 
-		retryCnt++
-
 		// 计算下一次重试时间
 		var waitTime time.Duration
 		if l.options.BackoffStrategy != nil {
@@ -86,6 +85,7 @@ func (l *RedisLock) Lock(ctx context.Context) error {
 
 		// 当到了重试的时间间隔，重新重试
 		case <-time.After(waitTime):
+			retryCnt++
 			continue
 		}
 	}
@@ -109,7 +109,7 @@ func (l *RedisLock) TryLock(ctx context.Context) error {
 
 	l.isLocked = true
 	if l.options.EnableWatchdog {
-		l.watchdog = NewWatchDog(l)
+		l.watchdog = NewWatchDog(l, WithInterval(500*time.Millisecond))
 		l.watchdog.Start()
 	}
 
@@ -120,12 +120,13 @@ func (l *RedisLock) TryLock(ctx context.Context) error {
 // 使用lua脚本保证redis操作的原子性
 func (l *RedisLock) tryAcquire(ctx context.Context) (bool, error) {
 	expireMS := int64(l.options.Expiration / time.Millisecond)
-	res, err := l.client.Eval(ctx, lockScript, []string{l.key}, l.val, expireMS).Result()
+	// 修改Result()为Int64()
+	res, err := l.client.Eval(ctx, lockScript, []string{l.key}, l.val, expireMS).Int64()
 	if err != nil {
 		return false, err
 	}
 
-	return res != nil, nil
+	return res == 1, nil
 }
 
 // Unlock 释放锁
@@ -141,13 +142,14 @@ func (l *RedisLock) Unlock(ctx context.Context) error {
 	}
 
 	// 释放锁
-	res, err := l.client.Eval(ctx, unlockScript, []string{l.key}, l.val).Result()
+	// 修改Result()为Int64()
+	res, err := l.client.Eval(ctx, unlockScript, []string{l.key}, l.val).Int64()
 	if err != nil {
 		return err
 	}
 
 	l.isLocked = false
-	if res == false {
+	if res == 0 {
 		return ferr.ErrLockNotHeld
 	}
 
@@ -161,12 +163,13 @@ func (l *RedisLock) Refresh(ctx context.Context) error {
 	}
 
 	expireMS := int64(l.options.Expiration / time.Millisecond)
-	res, err := l.client.Eval(ctx, refreshScript, []string{l.key}, l.val, expireMS).Result()
+	// 修改Result()为Int64()
+	res, err := l.client.Eval(ctx, refreshScript, []string{l.key}, l.val, expireMS).Int64()
 	if err != nil {
 		return err
 	}
 
-	if res == false {
+	if res == 0 {
 		l.isLocked = false // 续约失败，释放锁
 		return ferr.ErrLockNotHeld
 	}
