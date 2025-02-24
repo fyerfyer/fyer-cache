@@ -80,7 +80,7 @@ func (c *MemoryCache) Get(ctx context.Context, key string) (any, error) {
 	return item.value, nil
 }
 
-// Delete 实现缓存接口的Delete方法
+// Del 实现缓存接口的Delete方法
 func (c *MemoryCache) Del(ctx context.Context, key string) error {
 	if value, loaded := c.data.LoadAndDelete(key); loaded {
 		if c.onEvict != nil {
