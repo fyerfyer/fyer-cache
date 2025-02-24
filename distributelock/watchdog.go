@@ -7,7 +7,7 @@ import (
 )
 
 var (
-	defaultInterval       = 10 * time.Second
+	defaultInterval       = 500 * time.Millisecond
 	defaultRefreshTimeout = 3 * time.Second
 )
 
@@ -28,12 +28,18 @@ func WithInterval(interval time.Duration) WatchDogOpt {
 }
 
 // NewWatchDog 创建WatchDog实例
-func NewWatchDog(lock Lock) *WatchDog {
-	return &WatchDog{
+func NewWatchDog(lock Lock, opts ...WatchDogOpt) *WatchDog {
+	dog := &WatchDog{
 		lock:     lock,
 		stopChan: make(chan struct{}),
 		interval: defaultInterval,
 	}
+
+	for _, opt := range opts {
+		opt(dog)
+	}
+
+	return dog
 }
 
 // Start 启动watchdog
