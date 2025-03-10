@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -16,6 +17,7 @@ type EvictAlgorithm interface {
 // LRUEviction LRU淘汰算法
 type LRUEviction struct {
 	accessList *doubleLinkedList
+	mu         sync.RWMutex // 添加锁保护访问列表
 }
 
 // MemCacheMemory 缓存内存结构
@@ -25,11 +27,14 @@ type MemCacheMemory struct {
 	usedMemory int64
 	evict      EvictAlgorithm
 	accessList *doubleLinkedList
+	mu         sync.RWMutex // 添加锁保护内存管理相关操作
 }
 
 // doubleLinkedList 双向链表
 type doubleLinkedList struct {
 	head, tail *listNode
+	nodeMap    map[string]*listNode // 添加映射以提高查找效率
+	mu         sync.RWMutex         // 添加锁保护链表操作
 }
 
 // listNode 链表节点
@@ -41,13 +46,16 @@ type listNode struct {
 
 // NewMemCacheMemory 创建带内存淘汰的内存缓存实例
 func NewMemCacheMemory(c *MemoryCache, maxMemory int64) *MemCacheMemory {
+	// 先创建共享的访问列表
+	sharedList := newDoubleLinkedList()
+
 	mcm := &MemCacheMemory{
 		MemoryCache: c,
 		maxMemroy:   maxMemory,
 		evict: &LRUEviction{
-			accessList: newDoubleLinkedList(),
+			accessList: sharedList, // 使用共享列表
 		},
-		accessList: newDoubleLinkedList(),
+		accessList: sharedList, // 使用相同的共享列表
 	}
 
 	// 包装原有evict回调
@@ -69,7 +77,7 @@ func (c *MemCacheMemory) estimateObjectSize(obj any) int64 {
 	return sizeOf(reflect.ValueOf(obj))
 }
 
-// sizeOf 递归计算对象大小
+// sizeOf 递归计算对象大小 - 保持原有逻辑
 func sizeOf(v reflect.Value) int64 {
 	switch v.Kind() {
 	case reflect.Bool:
@@ -144,9 +152,12 @@ func sizeOf(v reflect.Value) int64 {
 	}
 }
 
+// Set 实现缓存Set方法，添加内存管理
 func (c *MemCacheMemory) Set(ctx context.Context, key string, val any, expiration time.Duration) error {
 	size := c.estimateObjectSize(val)
 
+	// 获取互斥锁进行内存管理操作
+	c.mu.Lock()
 	// 检查是否需要末位淘汰
 	for atomic.LoadInt64(&c.usedMemory)+size > c.maxMemroy {
 		evictKey := c.evict.Evict(c)
@@ -154,15 +165,24 @@ func (c *MemCacheMemory) Set(ctx context.Context, key string, val any, expiratio
 			break
 		}
 
+		// 释放锁，以免在Del操作时造成死锁
+		c.mu.Unlock()
 		c.Del(ctx, evictKey)
+		c.mu.Lock()
 	}
 
 	// 更新内存用量
 	atomic.AddInt64(&c.usedMemory, size)
+	c.mu.Unlock()
+
+	// 更新访问记录
 	c.accessList.add(key)
+
+	// 调用底层Set方法
 	return c.MemoryCache.Set(ctx, key, val, expiration)
 }
 
+// Get 实现缓存Get方法，更新访问记录
 func (c *MemCacheMemory) Get(ctx context.Context, key string) (any, error) {
 	val, err := c.MemoryCache.Get(ctx, key)
 	if err == nil {
@@ -172,6 +192,7 @@ func (c *MemCacheMemory) Get(ctx context.Context, key string) (any, error) {
 	return val, err
 }
 
+// Del 实现缓存Del方法，更新访问记录
 func (c *MemCacheMemory) Del(ctx context.Context, key string) error {
 	err := c.MemoryCache.Del(ctx, key)
 	if err == nil {
@@ -181,19 +202,38 @@ func (c *MemCacheMemory) Del(ctx context.Context, key string) error {
 	return err
 }
 
-// newLRUEviction 创建LRU淘汰算法实例
+// newDoubleLinkedList 创建新的双向链表
 func newDoubleLinkedList() *doubleLinkedList {
-	return &doubleLinkedList{
-		head: &listNode{},
-		tail: &listNode{},
+	dl := &doubleLinkedList{
+		head:    &listNode{},
+		tail:    &listNode{},
+		nodeMap: make(map[string]*listNode), // 初始化映射
 	}
+
+	// 确保头尾节点正确连接
+	dl.head.next = dl.tail
+	dl.tail.prev = dl.head
+
+	return dl
 }
 
+// add 添加节点到链表头部
 func (dl *doubleLinkedList) add(key string) {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+
+	// 如果节点已存在，先删除
+	if node, exists := dl.nodeMap[key]; exists {
+		node.prev.next = node.next
+		node.next.prev = node.prev
+	}
+
+	// 创建新节点
 	node := &listNode{
 		key:        key,
 		accesstime: time.Now(),
 	}
+
 	// 添加到链表头部
 	if dl.head.next == nil {
 		dl.head.next = node
@@ -206,47 +246,53 @@ func (dl *doubleLinkedList) add(key string) {
 		dl.head.next.prev = node
 		dl.head.next = node
 	}
+
+	// 更新映射
+	dl.nodeMap[key] = node
 }
 
+// access 更新节点访问时间并移动到头部
 func (dl *doubleLinkedList) access(key string) {
-	// 查找并移动到头部
-	current := dl.head.next
-	for current != dl.tail {
-		if current.key == key {
-			// 从当前位置移除
-			current.prev.next = current.next
-			current.next.prev = current.prev
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
 
-			// 添加到头部
-			current.next = dl.head.next
-			current.prev = dl.head
-			dl.head.next.prev = current
-			dl.head.next = current
-			current.accesstime = time.Now()
-			break
-		}
-		current = current.next
+	// 使用映射直接查找节点
+	if node, exists := dl.nodeMap[key]; exists {
+		// 从当前位置移除
+		node.prev.next = node.next
+		node.next.prev = node.prev
+
+		// 添加到头部
+		node.next = dl.head.next
+		node.prev = dl.head
+		dl.head.next.prev = node
+		dl.head.next = node
+		node.accesstime = time.Now()
 	}
 }
 
+// del 从链表中删除节点
 func (dl *doubleLinkedList) del(key string) {
-	current := dl.head.next
-	for current != dl.tail {
-		if current.key == key {
-			current.prev.next = current.next
-			current.next.prev = current.prev
-			break
-		}
-		current = current.next
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+
+	// 使用映射直接查找节点
+	if node, exists := dl.nodeMap[key]; exists {
+		node.prev.next = node.next
+		node.next.prev = node.prev
+		delete(dl.nodeMap, key) // 从映射中删除
 	}
 }
 
 // Evict LRU算法实现
 func (lru *LRUEviction) Evict(c *MemCacheMemory) string {
-	if c.accessList.tail.prev == c.accessList.head {
+	lru.mu.RLock()
+	defer lru.mu.RUnlock()
+
+	if lru.accessList.tail.prev == lru.accessList.head {
 		return ""
 	}
 
-	lruKey := c.accessList.tail.prev.key
+	lruKey := lru.accessList.tail.prev.key
 	return lruKey
 }

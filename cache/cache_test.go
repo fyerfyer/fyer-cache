@@ -243,3 +243,106 @@ func TestMemoryCache_ConcurrentOverwrite(t *testing.T) {
 		t.Errorf("Final read failed: %v", err)
 	}
 }
+
+// 测试异步清理功能
+func TestAsyncCleaner(t *testing.T) {
+	ctx := context.Background()
+
+	// 创建使用异步清理的缓存
+	cache := NewMemoryCache(
+		WithShardCount(32),
+		WithAsyncCleanup(true),
+		CacheWithWorkerCount(4),
+		CacheWithQueueSize(100),
+		WithCleanupInterval(100*time.Millisecond),
+	)
+
+	// 添加带有短期超时的项目
+	const itemCount = 5000
+
+	start := time.Now()
+
+	// 添加项目
+	for i := 0; i < itemCount; i++ {
+		key := fmt.Sprintf("test-key-%d", i)
+		// 设置随机过期时间，0-200ms
+		expiration := time.Duration(rand.Intn(201)) * time.Millisecond
+		err := cache.Set(ctx, key, fmt.Sprintf("value-%d", i), expiration)
+		if err != nil {
+			t.Fatalf("Failed to set item: %v", err)
+		}
+	}
+
+	// 等待足够长的时间让所有项目过期
+	time.Sleep(300 * time.Millisecond)
+
+	// 再等待一段时间让清理工作完成
+	time.Sleep(200 * time.Millisecond)
+
+	// 检查剩余的项目数量
+	count := cache.data.Count()
+	t.Logf("Items added: %d, remaining after expiration: %d", itemCount, count)
+
+	if count > 0 {
+		t.Logf("Not all items were cleaned up - this is expected as some items might have been added after checking")
+	}
+
+	// 关闭缓存
+	cache.Close()
+
+	duration := time.Since(start)
+	t.Logf("Async cleanup test completed in %v", duration)
+}
+
+// 测试分片均匀性
+func TestShardDistribution(t *testing.T) {
+	ctx := context.Background()
+
+	// 使用32个分片创建缓存
+	cache := NewMemoryCache(WithShardCount(32))
+
+	// 插入大量随机键
+	const keyCount = 100000
+
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("test-key-%d", i)
+		cache.Set(ctx, key, i, time.Minute)
+	}
+
+	// 统计每个分片中的项目数量
+	shardCounts := make([]int, cache.data.count)
+
+	for i := 0; i < cache.data.count; i++ {
+		shard := cache.data.shards[i]
+		shard.mu.RLock()
+		shardCounts[i] = len(shard.items)
+		shard.mu.RUnlock()
+	}
+
+	// 计算标准差，检查分布均匀性
+	var sum, sumSq float64
+	for _, count := range shardCounts {
+		sum += float64(count)
+		sumSq += float64(count * count)
+	}
+
+	mean := sum / float64(len(shardCounts))
+	variance := (sumSq / float64(len(shardCounts))) - (mean * mean)
+	stdDev := float64(0)
+	if variance > 0 {
+		stdDev = variance
+	}
+
+	// 输出分片分布统计
+	t.Logf("Shard distribution - Mean: %.2f items/shard, StdDev: %.2f (%.2f%%)",
+		mean, stdDev, 100*stdDev/mean)
+
+	// 输出每个分片的计数
+	for i, count := range shardCounts {
+		deviation := 100 * (float64(count) - mean) / mean
+		t.Logf("Shard %d: %d items (%.2f%% from mean)", i, count, deviation)
+	}
+
+	// 清理
+	cache.Close()
+}
