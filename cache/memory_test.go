@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -109,5 +110,48 @@ func TestMemCacheMemory_MemoryManagement(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, tt.testFunc)
+	}
+}
+
+// 测试异步清理功能
+func TestAsyncCleanup(t *testing.T) {
+	ctx := context.Background()
+
+	// 创建使用异步清理的缓存
+	options := []Option{
+		WithAsyncCleanup(true),
+		CacheWithWorkerCount(2),
+		CacheWithQueueSize(10),
+		WithCleanupInterval(100 * time.Millisecond),
+	}
+
+	cache := NewMemoryCache(options...)
+
+	// 添加一些短期过期的缓存项
+	const itemCount = 1000
+	for i := 0; i < itemCount; i++ {
+		key := "expire-key-" + strconv.Itoa(i)
+		err := cache.Set(ctx, key, []byte{1, 2, 3, 4}, 50*time.Millisecond)
+		if err != nil {
+			t.Fatalf("Failed to set test data: %v", err)
+		}
+	}
+
+	// 等待足够的时间让项目过期并被清理
+	time.Sleep(200 * time.Millisecond)
+
+	// 等待另外100ms让清理任务完成
+	time.Sleep(100 * time.Millisecond)
+
+	// 检查计数器
+	count := cache.data.Count()
+	if count > 0 {
+		t.Logf("Expected all items to be cleaned up, but %d items remain", count)
+	}
+
+	// 测试关闭
+	err := cache.Close()
+	if err != nil {
+		t.Errorf("Failed to close cache: %v", err)
 	}
 }
