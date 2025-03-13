@@ -92,3 +92,48 @@ func WithCleanerEvictionCallback(callback func(key string, value any)) CleanerOp
 		c.onEvict = callback
 	}
 }
+
+// NodeShardedCacheOption 节点分片缓存选项
+type NodeShardedCacheOption func(*NodeShardedCache)
+
+// WithNodeHashReplicas 设置每个物理节点的虚拟节点数量
+func WithNodeHashReplicas(replicas int) NodeShardedCacheOption {
+	return func(nsc *NodeShardedCache) {
+		if ring, ok := nsc.ring.(*ConsistentHash); ok && ring != nil {
+			ring.replicas = replicas
+		}
+	}
+}
+
+// WithNodeCustomHashFunc 设置自定义哈希函数
+func WithNodeCustomHashFunc(fn HashFunc) NodeShardedCacheOption {
+	return func(nsc *NodeShardedCache) {
+		// 重新创建一致性哈希环，应用新的哈希函数
+		oldRing := nsc.ring
+		newRing := NewConsistentHash(defaultReplicas, fn)
+
+		// 迁移所有节点
+		for _, nodeID := range oldRing.GetNodes() {
+			// 获取原节点权重
+			weight := 1
+			if ch, ok := oldRing.(*ConsistentHash); ok {
+				if w, exists := ch.weights[nodeID]; exists {
+					weight = w
+				}
+			}
+			newRing.Add(nodeID, weight)
+		}
+
+		nsc.ring = newRing
+	}
+}
+
+// WithNodeReplicaFactor 设置备份因子
+// 每个键将被复制到多少个节点（默认为1，表示没有备份）
+func WithNodeReplicaFactor(factor int) NodeShardedCacheOption {
+	return func(nsc *NodeShardedCache) {
+		if factor > 0 {
+			nsc.replicaFactor = factor
+		}
+	}
+}
