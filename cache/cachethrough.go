@@ -8,14 +8,6 @@ import (
 	"time"
 )
 
-// DataSource 数据源接口
-// 表示read through和write through中的数据来源
-type DataSource interface {
-	Load(ctx context.Context, key string) (any, error)
-	Store(ctx context.Context, key string, val any) error
-	Remove(ctx context.Context, key string) error
-}
-
 var defaultTTL = 5 * time.Minute
 
 // ThroughCache 实现读写穿透的缓存装饰器
