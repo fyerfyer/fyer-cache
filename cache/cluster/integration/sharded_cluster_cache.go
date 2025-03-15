@@ -163,7 +163,7 @@ func (scc *ShardedClusterCache) Join(seedNodeAddr string) error {
 	scc.mu.RUnlock()
 
 	if !running {
-		return fmt.Errorf("cache must be started before joining a cluster")
+		return fmt.Errorf("cache not started")
 	}
 
 	// 加入集群
@@ -176,7 +176,7 @@ func (scc *ShardedClusterCache) Join(seedNodeAddr string) error {
 	members := scc.node.Members()
 	err = scc.nodeDistributor.InitFromMembers(members)
 	if err != nil {
-		return fmt.Errorf("failed to initialize from members: %w", err)
+		return fmt.Errorf("failed to initialize node distributor: %w", err)
 	}
 
 	return nil
