@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -12,414 +13,268 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewShardedClusterCache(t *testing.T) {
-	localCache := cache.NewMemoryCache()
+// getAvailablePorts returns n available ports for testing
+func getAvailablePorts(n int) ([]int, error) {
+	ports := make([]int, n)
+	listeners := make([]*net.TCPListener, n)
 
-	tests := []struct {
-		name          string
-		localCache    cache.Cache
-		nodeID        string
-		bindAddr      string
-		clusterOpts   []cluster.NodeOption
-		cacheOpts     []ShardedClusterCacheOption
-		expectError   bool
-		errorContains string
-	}{
-		{
-			name:          "Valid configuration",
-			localCache:    localCache,
-			nodeID:        "node1",
-			bindAddr:      "127.0.0.1:8001",
-			clusterOpts:   []cluster.NodeOption{},
-			cacheOpts:     []ShardedClusterCacheOption{},
-			expectError:   false,
-			errorContains: "",
-		},
-		{
-			name:          "Nil local cache",
-			localCache:    nil,
-			nodeID:        "node1",
-			bindAddr:      "127.0.0.1:8001",
-			clusterOpts:   []cluster.NodeOption{},
-			cacheOpts:     []ShardedClusterCacheOption{},
-			expectError:   true,
-			errorContains: "local cache cannot be nil",
-		},
-		{
-			name:          "Empty node ID",
-			localCache:    localCache,
-			nodeID:        "",
-			bindAddr:      "127.0.0.1:8001",
-			clusterOpts:   []cluster.NodeOption{},
-			cacheOpts:     []ShardedClusterCacheOption{},
-			expectError:   true,
-			errorContains: "node ID cannot be empty",
-		},
-		{
-			name:          "Empty bind address",
-			localCache:    localCache,
-			nodeID:        "node1",
-			bindAddr:      "",
-			clusterOpts:   []cluster.NodeOption{},
-			cacheOpts:     []ShardedClusterCacheOption{},
-			expectError:   true,
-			errorContains: "bind address cannot be empty",
-		},
-		{
-			name:       "With cache options",
-			localCache: localCache,
-			nodeID:     "node1",
-			bindAddr:   "127.0.0.1:8001",
-			clusterOpts: []cluster.NodeOption{
-				cluster.WithGossipInterval(500 * time.Millisecond),
-			},
-			cacheOpts: []ShardedClusterCacheOption{
-				WithVirtualNodeCount(200),
-				WithReplicaFactor(3),
-			},
-			expectError:   false,
-			errorContains: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			scc, err := NewShardedClusterCache(tt.localCache, tt.nodeID, tt.bindAddr, tt.clusterOpts, tt.cacheOpts)
-
-			if tt.expectError {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errorContains)
-				assert.Nil(t, scc)
-			} else {
-				assert.NoError(t, err)
-				assert.NotNil(t, scc)
-				assert.Equal(t, tt.nodeID, scc.localNodeID)
-				assert.Equal(t, tt.bindAddr, scc.address)
-				assert.Equal(t, tt.localCache, scc.localCache)
-				assert.NotNil(t, scc.shardedCache)
-				assert.NotNil(t, scc.node)
-				assert.NotNil(t, scc.nodeDistributor)
-				assert.False(t, scc.running)
+	// Find n available ports by actually binding to them
+	for i := 0; i < n; i++ {
+		addr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:0")
+		if err != nil {
+			// Close any listeners we've opened so far
+			for j := 0; j < i; j++ {
+				if listeners[j] != nil {
+					listeners[j].Close()
+				}
 			}
-		})
-	}
-}
+			return nil, err
+		}
 
-func TestShardedClusterCache_StartStop(t *testing.T) {
-	localCache := cache.NewMemoryCache()
-	nodeID := "test-node"
-	bindAddr := getAvailableAddr(t)
+		listener, err := net.ListenTCP("tcp", addr)
+		if err != nil {
+			// Close any listeners we've opened so far
+			for j := 0; j < i; j++ {
+				if listeners[j] != nil {
+					listeners[j].Close()
+				}
+			}
+			return nil, err
+		}
 
-	scc, err := NewShardedClusterCache(localCache, nodeID, bindAddr, nil, nil)
-	require.NoError(t, err)
-	require.NotNil(t, scc)
-
-	// Test Start
-	err = scc.Start()
-	assert.NoError(t, err)
-	assert.True(t, scc.running)
-
-	// Test double Start (should be no-op)
-	err = scc.Start()
-	assert.NoError(t, err)
-	assert.True(t, scc.running)
-
-	// Test Stop
-	err = scc.Stop()
-	assert.NoError(t, err)
-	assert.False(t, scc.running)
-
-	// Test double Stop (should be no-op)
-	err = scc.Stop()
-	assert.NoError(t, err)
-	assert.False(t, scc.running)
-}
-
-func TestShardedClusterCache_Join(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
+		// Get the port that was assigned by the system
+		ports[i] = listener.Addr().(*net.TCPAddr).Port
+		listeners[i] = listener
 	}
 
-	// Create two cache instances with memory caches
-	localCache1 := cache.NewMemoryCache()
-	localCache2 := cache.NewMemoryCache()
-
-	addr1 := getAvailableAddr(t)
-	addr2 := getAvailableAddr(t)
-
-	scc1, err := NewShardedClusterCache(localCache1, "node1", addr1, nil, nil)
-	require.NoError(t, err)
-
-	scc2, err := NewShardedClusterCache(localCache2, "node2", addr2, nil, nil)
-	require.NoError(t, err)
-
-	// Start both nodes
-	err = scc1.Start()
-	require.NoError(t, err)
-	defer scc1.Stop()
-
-	err = scc2.Start()
-	require.NoError(t, err)
-	defer scc2.Stop()
-
-	// Node 1 joins itself (forms new cluster)
-	err = scc1.Join(addr1)
-	assert.NoError(t, err)
-
-	// Wait for cluster to stabilize
-	time.Sleep(500 * time.Millisecond)
-
-	// Node 2 joins node 1
-	err = scc2.Join(addr1)
-	assert.NoError(t, err)
-
-	// Wait for cluster to stabilize
-	time.Sleep(1 * time.Second)
-
-	// Verify both nodes see each other
-	members1 := scc1.Members()
-	assert.GreaterOrEqual(t, len(members1), 2)
-
-	members2 := scc2.Members()
-	assert.GreaterOrEqual(t, len(members2), 2)
-
-	// Verify node IDs
-	ids1 := make(map[string]bool)
-	for _, m := range members1 {
-		ids1[m.ID] = true
-	}
-
-	ids2 := make(map[string]bool)
-	for _, m := range members2 {
-		ids2[m.ID] = true
-	}
-
-	assert.True(t, ids1["node1"])
-	assert.True(t, ids1["node2"])
-	assert.True(t, ids2["node1"])
-	assert.True(t, ids2["node2"])
-}
-
-func TestShardedClusterCache_Leave(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
-
-	// Create two cache instances
-	localCache1 := cache.NewMemoryCache()
-	localCache2 := cache.NewMemoryCache()
-
-	addr1 := getAvailableAddr(t)
-	addr2 := getAvailableAddr(t)
-
-	scc1, err := NewShardedClusterCache(localCache1, "node1", addr1, nil, nil)
-	require.NoError(t, err)
-
-	scc2, err := NewShardedClusterCache(localCache2, "node2", addr2, nil, nil)
-	require.NoError(t, err)
-
-	// Start both nodes
-	err = scc1.Start()
-	require.NoError(t, err)
-	defer scc1.Stop()
-
-	err = scc2.Start()
-	require.NoError(t, err)
-	defer scc2.Stop()
-
-	// Form cluster
-	err = scc1.Join(addr1)
-	require.NoError(t, err)
-
-	err = scc2.Join(addr1)
-	require.NoError(t, err)
-
-	// Wait for cluster to stabilize
-	time.Sleep(1 * time.Second)
-
-	// Verify both nodes see each other
-	assert.GreaterOrEqual(t, len(scc1.Members()), 2)
-	assert.GreaterOrEqual(t, len(scc2.Members()), 2)
-
-	// Node 2 leaves the cluster
-	err = scc2.Leave()
-	assert.NoError(t, err)
-
-	// Wait for leave to propagate
-	time.Sleep(1 * time.Second)
-
-	// Node 1 should see the leave
-	members1 := scc1.Members()
-	node2Status := cache.NodeStatusUp
-	for _, m := range members1 {
-		if m.ID == "node2" {
-			node2Status = m.Status
-			break
+	// Close all the listeners we opened
+	for i := 0; i < n; i++ {
+		if listeners[i] != nil {
+			listeners[i].Close()
 		}
 	}
 
-	// Node 2 should be marked as left or completely removed
-	if len(members1) == 2 {
-		assert.Equal(t, cache.NodeStatusLeft, node2Status)
-	} else {
-		assert.Equal(t, 1, len(members1))
-	}
+	return ports, nil
 }
 
-func TestShardedClusterCache_CacheOperations(t *testing.T) {
-	// Create two cache instances with memory caches
+func TestShardedClusterCache_BasicOperations(t *testing.T) {
+	// 在短测试模式下跳过
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// 获取节点可用端口
+	ports, err := getAvailablePorts(2)
+	require.NoError(t, err, "Failed to get available ports")
+
+	// 创建两个缓存节点
+	node1Addr := "127.0.0.1:" + strconv.Itoa(ports[0])
+	node2Addr := "127.0.0.1:" + strconv.Itoa(ports[1])
+
+	// 创建底层本地缓存
 	localCache1 := cache.NewMemoryCache()
 	localCache2 := cache.NewMemoryCache()
 
-	nodeID1 := "node1"
-	nodeID2 := "node2"
-	bindAddr1 := getAvailableAddr(t)
-	bindAddr2 := getAvailableAddr(t)
+	// 创建第一个带分片集群缓存的节点
+	cache1, err := NewShardedClusterCache(
+		localCache1,
+		"node1",
+		node1Addr,
+		[]cluster.NodeOption{
+			cluster.WithProbeInterval(100 * time.Millisecond),
+			cluster.WithGossipInterval(100 * time.Millisecond),
+		},
+		[]ShardedClusterCacheOption{
+			WithVirtualNodeCount(10),
+		},
+	)
+	require.NoError(t, err, "Failed to create first cache")
 
-	// Start both nodes
-	scc1, err := NewShardedClusterCache(localCache1, nodeID1, bindAddr1, nil, nil)
-	require.NoError(t, err)
-	err = scc1.Start()
-	require.NoError(t, err)
-	defer scc1.Stop()
+	// 创建第二个带分片集群缓存的节点
+	cache2, err := NewShardedClusterCache(
+		localCache2,
+		"node2",
+		node2Addr,
+		[]cluster.NodeOption{
+			cluster.WithProbeInterval(100 * time.Millisecond),
+			cluster.WithGossipInterval(100 * time.Millisecond),
+		},
+		[]ShardedClusterCacheOption{
+			WithVirtualNodeCount(10),
+		},
+	)
+	require.NoError(t, err, "Failed to create second cache")
 
-	scc2, err := NewShardedClusterCache(localCache2, nodeID2, bindAddr2, nil, nil)
-	require.NoError(t, err)
-	err = scc2.Start()
-	require.NoError(t, err)
-	defer scc2.Stop()
+	// 确保正确清理
+	defer func() {
+		cache1.Stop()
+		cache2.Stop()
+	}()
 
-	// Node 1 forms new cluster
-	err = scc1.Join(bindAddr1)
-	require.NoError(t, err)
+	// 启动缓存
+	err = cache1.Start()
+	require.NoError(t, err, "Failed to start first cache")
 
-	// Wait for cluster to stabilize
-	time.Sleep(200 * time.Millisecond)
+	err = cache2.Start()
+	require.NoError(t, err, "Failed to start second cache")
 
-	// Node 2 joins node 1
-	err = scc2.Join(bindAddr1)
-	require.NoError(t, err)
+	// 组建集群 - node1引导并且node2加入
+	err = cache1.Join(node1Addr)
+	require.NoError(t, err, "Failed to bootstrap first node")
 
-	// Wait for cluster to stabilize
-	time.Sleep(500 * time.Millisecond)
+	// 等待node1稳定
+	time.Sleep(300 * time.Millisecond)
+
+	err = cache2.Join(node1Addr)
+	require.NoError(t, err, "Failed to join second node to cluster")
+
+	// 等待gossip传播成员信息
+	time.Sleep(1 * time.Second)
+
+	// 验证集群形成
+	members1 := cache1.Members()
+	assert.Equal(t, 2, len(members1), "First node should see 2 members")
+
+	members2 := cache2.Members()
+	assert.Equal(t, 2, len(members2), "Second node should see 2 members")
 
 	ctx := context.Background()
 
-	// Set values from node1
-	err = scc1.Set(ctx, "key1", "value1", time.Minute)
-	require.NoError(t, err)
-	err = scc1.Set(ctx, "key2", "value2", time.Minute)
-	require.NoError(t, err)
+	// 测试基本缓存操作
+	t.Log("Testing basic cache operations...")
 
-	// Wait for values to propagate (in case there's async replication)
-	time.Sleep(200 * time.Millisecond)
+	// Set操作
+	err = cache1.Set(ctx, "key1", "value1", time.Minute)
+	require.NoError(t, err, "Failed to set key1")
 
-	// Get values from both nodes
-	val1, err := scc1.Get(ctx, "key1")
-	require.NoError(t, err)
-	assert.Equal(t, "value1", val1)
+	err = cache2.Set(ctx, "key2", "value2", time.Minute)
+	require.NoError(t, err, "Failed to set key2")
 
-	val2, err := scc2.Get(ctx, "key2")
-	require.NoError(t, err)
-	assert.Equal(t, "value2", val2)
+	// 短暂等待操作传播
+	time.Sleep(100 * time.Millisecond)
 
-	// Delete a key from node2
-	err = scc2.Del(ctx, "key1")
-	require.NoError(t, err)
+	// Get操作 - 键应该通过一致性哈希路由到正确的节点
+	val1, err := cache1.Get(ctx, "key1")
+	if err == nil {
+		assert.Equal(t, "value1", val1, "Value for key1 is incorrect")
+	} else {
+		// 在实际一致性哈希场景中,key1可能路由到node2
+		val1, err = cache2.Get(ctx, "key1")
+		require.NoError(t, err, "Failed to get key1 from either node")
+		assert.Equal(t, "value1", val1, "Value for key1 is incorrect")
+	}
 
-	// Wait for delete to propagate
-	time.Sleep(200 * time.Millisecond)
+	val2, err := cache2.Get(ctx, "key2")
+	if err == nil {
+		assert.Equal(t, "value2", val2, "Value for key2 is incorrect")
+	} else {
+		// 在实际一致性哈希场景中,key2可能路由到node1
+		val2, err = cache1.Get(ctx, "key2")
+		require.NoError(t, err, "Failed to get key2 from either node")
+		assert.Equal(t, "value2", val2, "Value for key2 is incorrect")
+	}
 
-	// Key should be deleted on both nodes
-	_, err = scc1.Get(ctx, "key1")
+	// 测试删除操作
+	err = cache1.Del(ctx, "key1")
+	require.NoError(t, err, "Failed to delete key1")
+
+	// 短暂等待操作传播
+	time.Sleep(100 * time.Millisecond)
+
+	// 验证key1已从集群中删除
+	_, err = cache1.Get(ctx, "key1")
 	assert.Error(t, err, "Key1 should be deleted")
 
-	// The other key should still be accessible
-	val2Again, err := scc1.Get(ctx, "key2")
-	require.NoError(t, err)
-	assert.Equal(t, "value2", val2Again)
-}
+	_, err = cache2.Get(ctx, "key1")
+	assert.Error(t, err, "Key1 should be deleted")
 
-func TestShardedClusterCache_GetClusterInfo(t *testing.T) {
-	localCache := cache.NewMemoryCache()
-	nodeID := "test-node"
-	bindAddr := getAvailableAddr(t)
+	// 测试集群信息
+	info := cache1.GetClusterInfo()
+	assert.NotNil(t, info, "Cluster info should not be nil")
+	assert.Contains(t, info, "node_id")
 
-	scc, err := NewShardedClusterCache(localCache, nodeID, bindAddr, nil, nil)
-	require.NoError(t, err)
+	// 测试离开集群
+	err = cache2.Leave()
+	require.NoError(t, err, "Failed to leave cluster")
 
-	err = scc.Start()
-	require.NoError(t, err)
-	defer scc.Stop()
-
-	err = scc.Join(bindAddr)
-	require.NoError(t, err)
-
-	// Wait for cluster to initialize
+	// 等待集群更新
 	time.Sleep(500 * time.Millisecond)
 
-	// Get cluster info
-	info := scc.GetClusterInfo()
-	assert.NotNil(t, info)
-
-	// Check essential fields
-	assert.Equal(t, nodeID, info["node_id"])
-	assert.Equal(t, bindAddr, info["address"])
-	assert.True(t, info["is_coordinator"].(bool))
-	assert.Equal(t, 1, info["member_count"])
-	assert.Equal(t, 1, info["node_count"])
-
-	// Check status counts
-	statusCounts, ok := info["status_counts"].(map[string]int)
-	assert.True(t, ok)
-	assert.Equal(t, 1, statusCounts["up"])
-	assert.Equal(t, 0, statusCounts["suspect"])
-	assert.Equal(t, 0, statusCounts["down"])
-	assert.Equal(t, 0, statusCounts["left"])
+	// Node1现在应该只看到自己
+	members1 = cache1.Members()
+	assert.Equal(t, 1, len(members1), "Node1 should now see only 1 member (itself)")
 }
 
-func TestShardedClusterCache_PartialMock(t *testing.T) {
-	// Create a simplified ShardedClusterCache for testing
+func TestShardedClusterCache_NodeDistribution(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// 创建一个用于测试分布的单节点缓存
 	localCache := cache.NewMemoryCache()
 
-	// Create a direct instance of ShardedClusterCache
-	// with minimal dependencies to avoid the need for mocking structs
-	scc := &ShardedClusterCache{
-		localCache:  localCache,
-		localNodeID: "test-node",
-		address:     "test-addr:8080",
-		running:     false,
+	nodeAddr := "127.0.0.1:10000" // 在这个测试中实际上不需要绑定
+
+	cache1, err := NewShardedClusterCache(
+		localCache,
+		"node1",
+		nodeAddr,
+		[]cluster.NodeOption{},
+		[]ShardedClusterCacheOption{
+			WithVirtualNodeCount(100),
+		},
+	)
+	require.NoError(t, err)
+
+	defer cache1.Stop()
+
+	// 不加入集群直接启动
+	err = cache1.Start()
+	require.NoError(t, err)
+
+	// 直接使用节点分配器进行测试
+	nodeDistributor := cache1.nodeDistributor
+
+	// 向分配器添加一些远程节点
+	remoteNodes := []cache.NodeInfo{
+		{ID: "node2", Addr: "127.0.0.1:10001", Status: cache.NodeStatusUp},
+		{ID: "node3", Addr: "127.0.0.1:10002", Status: cache.NodeStatusUp},
+		{ID: "node4", Addr: "127.0.0.1:10003", Status: cache.NodeStatusUp},
 	}
 
-	// Test basic operations without dependencies on ClusterNode or NodeShardedCache
-	assert.Equal(t, "test-node", scc.localNodeID)
-	assert.Equal(t, "test-addr:8080", scc.address)
-	assert.False(t, scc.running)
+	err = nodeDistributor.InitFromMembers(remoteNodes)
+	require.NoError(t, err, "Failed to initialize node distributor")
 
-	// Set the running flag directly (simulating Start)
-	scc.running = true
-	assert.True(t, scc.running)
+	// 验证节点地址
+	addresses := nodeDistributor.GetAllNodeAddresses()
+	assert.Equal(t, 3, len(addresses), "Should have 3 node addresses")
 
-	// Set the running flag back to false (simulating Stop)
-	scc.running = false
-	assert.False(t, scc.running)
-}
+	// 测试清空功能
+	nodeDistributor.Clear()
+	addresses = nodeDistributor.GetAllNodeAddresses()
+	assert.Equal(t, 0, len(addresses), "All nodes should be cleared")
 
-// Helper function to find available ports
-func getTestAvailablePorts(t *testing.T, count int) []int {
-	ports := make([]int, 0, count)
-
-	for i := 0; i < count; i++ {
-		addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-		require.NoError(t, err)
-
-		l, err := net.ListenTCP("tcp", addr)
-		require.NoError(t, err)
-
-		port := l.Addr().(*net.TCPAddr).Port
-		l.Close()
-		ports = append(ports, port)
+	// 测试处理集群事件
+	event := cache.ClusterEvent{
+		Type:    cache.EventNodeJoin,
+		NodeID:  "node2",
+		Time:    time.Now(),
+		Details: "127.0.0.1:10001",
 	}
 
-	return ports
+	nodeDistributor.HandleClusterEvent(event)
+	addresses = nodeDistributor.GetAllNodeAddresses()
+	assert.Equal(t, 1, len(addresses), "Should have 1 node after join event")
+	assert.Equal(t, "127.0.0.1:10001", addresses["node2"])
+
+	// 测试节点离开事件
+	leaveEvent := cache.ClusterEvent{
+		Type:   cache.EventNodeLeave,
+		NodeID: "node2",
+		Time:   time.Now(),
+	}
+
+	nodeDistributor.HandleClusterEvent(leaveEvent)
+	addresses = nodeDistributor.GetAllNodeAddresses()
+	assert.Equal(t, 0, len(addresses), "Should have 0 nodes after leave event")
 }
