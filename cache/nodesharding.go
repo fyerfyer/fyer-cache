@@ -134,23 +134,29 @@ func (nsc *NodeShardedCache) Get(ctx context.Context, key string) (any, error) {
 
 	// 检查是否有节点
 	if len(nsc.nodes) == 0 {
+		fmt.Printf("[NodeShardedCache.Get] No nodes available\n")
 		nsc.mu.RUnlock()
-		return nil, ferr.ErrKeyNotFound
+		return nil, fmt.Errorf("no nodes available")
 	}
 
 	// 获取包含该键的所有节点
 	var nodeIDs []string
 	if nsc.replicaFactor > 1 {
 		nodeIDs = nsc.ring.GetN(key, nsc.replicaFactor)
+		fmt.Printf("[NodeShardedCache.Get] Getting key=%s from %d nodes: %v\n", key, nsc.replicaFactor, nodeIDs)
 	} else {
 		nodeIDs = []string{nsc.ring.Get(key)}
+		fmt.Printf("[NodeShardedCache.Get] Getting key=%s from node: %s\n", key, nodeIDs[0])
 	}
 
-	// 复制必要的节点信息，避免长时间持有锁
+	// 复制必要的节点信息
 	nodeCaches := make([]Cache, 0, len(nodeIDs))
 	for _, nodeID := range nodeIDs {
 		if cache, exists := nsc.nodes[nodeID]; exists {
 			nodeCaches = append(nodeCaches, cache)
+			fmt.Printf("[NodeShardedCache.Get] Found cache for node=%s\n", nodeID)
+		} else {
+			fmt.Printf("[NodeShardedCache.Get] No cache found for node=%s\n", nodeID)
 		}
 	}
 
@@ -158,56 +164,57 @@ func (nsc *NodeShardedCache) Get(ctx context.Context, key string) (any, error) {
 
 	// 首先检查主节点
 	if len(nodeCaches) == 0 {
+		fmt.Printf("[NodeShardedCache.Get] No cache nodes found for key=%s\n", key)
 		return nil, ferr.ErrKeyNotFound
 	}
 
+	fmt.Printf("[NodeShardedCache.Get] Trying primary node for key=%s\n", key)
 	primaryValue, err := nodeCaches[0].Get(ctx, key)
 	if err == nil {
+		fmt.Printf("[NodeShardedCache.Get] Primary node returned value=%v\n", primaryValue)
 		return primaryValue, nil
+	} else {
+		fmt.Printf("[NodeShardedCache.Get] Primary node failed with err=%v\n", err)
 	}
 
 	// 如果有备份节点，尝试从备份节点获取
 	for i := 1; i < len(nodeCaches); i++ {
-		value, err := nodeCaches[i].Get(ctx, key)
+		fmt.Printf("[NodeShardedCache.Get] Trying backup node %d for key=%s\n", i, key)
+		backupValue, err := nodeCaches[i].Get(ctx, key)
 		if err == nil {
-			// 异步修复主节点数据
-			go func() {
-				nsc.mu.RLock()
-				primaryNodeID := nodeIDs[0]
-				primaryCache, exists := nsc.nodes[primaryNodeID]
-				nsc.mu.RUnlock()
-
-				if exists {
-					primaryCache.Set(ctx, key, value, time.Hour) // 使用默认过期时间
-				}
-			}()
-
-			return value, nil
+			fmt.Printf("[NodeShardedCache.Get] Backup node %d returned value=%v\n", i, backupValue)
+			return backupValue, nil
+		} else {
+			fmt.Printf("[NodeShardedCache.Get] Backup node %d failed with err=%v\n", i, err)
 		}
 	}
 
+	fmt.Printf("[NodeShardedCache.Get] All nodes failed for key=%s\n", key)
 	return nil, ferr.ErrKeyNotFound
 }
 
 // Set 将缓存项设置到正确的节点
 func (nsc *NodeShardedCache) Set(ctx context.Context, key string, val any, expiration time.Duration) error {
 	nsc.mu.RLock()
+	defer nsc.mu.RUnlock()
 
 	// 检查是否有节点
 	if len(nsc.nodes) == 0 {
-		nsc.mu.RUnlock()
-		return fmt.Errorf("no cache nodes available")
+		fmt.Printf("[NodeShardedCache.Set] No nodes available\n")
+		return fmt.Errorf("no nodes available")
 	}
 
 	// 获取应存储键的所有节点
 	var nodeIDs []string
 	if nsc.replicaFactor > 1 {
 		nodeIDs = nsc.ring.GetN(key, nsc.replicaFactor)
+		fmt.Printf("[NodeShardedCache.Set] Setting key=%s on %d nodes: %v\n", key, nsc.replicaFactor, nodeIDs)
 	} else {
 		nodeIDs = []string{nsc.ring.Get(key)}
+		fmt.Printf("[NodeShardedCache.Set] Setting key=%s on node: %s\n", key, nodeIDs[0])
 	}
 
-	// 复制必要的节点信息
+	// 复制必要的节点信息，并跟踪每个节点
 	nodeCaches := make([]struct {
 		id    string
 		cache Cache
@@ -218,37 +225,49 @@ func (nsc *NodeShardedCache) Set(ctx context.Context, key string, val any, expir
 			nodeCaches = append(nodeCaches, struct {
 				id    string
 				cache Cache
-			}{nodeID, cache})
+			}{id: nodeID, cache: cache})
+			fmt.Printf("[NodeShardedCache.Set] Found cache for node=%s\n", nodeID)
+		} else {
+			fmt.Printf("[NodeShardedCache.Set] No cache found for node=%s\n", nodeID)
 		}
 	}
 
-	nsc.mu.RUnlock()
-
 	if len(nodeCaches) == 0 {
-		return fmt.Errorf("no available nodes for key: %s", key)
+		fmt.Printf("[NodeShardedCache.Set] No nodes available to set key=%s\n", key)
+		return fmt.Errorf("no nodes available to set key %s", key)
 	}
 
 	// 在主节点设置值
-	var primaryErr error
-	if err := nodeCaches[0].cache.Set(ctx, key, val, expiration); err != nil {
-		primaryErr = fmt.Errorf("primary node set failed: %w", err)
+	fmt.Printf("[NodeShardedCache.Set] Setting on primary node=%s, key=%s\n", nodeCaches[0].id, key)
+	primaryErr := nodeCaches[0].cache.Set(ctx, key, val, expiration)
+	if primaryErr != nil {
+		fmt.Printf("[NodeShardedCache.Set] Primary node set failed: %v\n", primaryErr)
+	} else {
+		fmt.Printf("[NodeShardedCache.Set] Primary node set succeeded\n")
 	}
 
-	// 在备份节点设置值
+	// 在备份节点设置值，并记录日志
 	var backupErrors []error
 	for i := 1; i < len(nodeCaches); i++ {
-		if err := nodeCaches[i].cache.Set(ctx, key, val, expiration); err != nil {
-			backupErrors = append(backupErrors, fmt.Errorf("backup node %s set failed: %w", nodeCaches[i].id, err))
+		fmt.Printf("[NodeShardedCache.Set] Setting on backup node=%s, key=%s\n", nodeCaches[i].id, key)
+		err := nodeCaches[i].cache.Set(ctx, key, val, expiration)
+		if err != nil {
+			fmt.Printf("[NodeShardedCache.Set] Backup node set failed: %v\n", err)
+			backupErrors = append(backupErrors, err)
+		} else {
+			fmt.Printf("[NodeShardedCache.Set] Backup node set succeeded\n")
 		}
 	}
 
 	// 如果主节点失败，但有备份成功，认为操作成功
 	if primaryErr != nil && len(backupErrors) < len(nodeCaches)-1 {
+		fmt.Printf("[NodeShardedCache.Set] Primary failed but at least one backup succeeded\n")
 		return nil
 	}
 
 	// 如果主节点失败，返回错误
 	if primaryErr != nil {
+		fmt.Printf("[NodeShardedCache.Set] Returning primary error\n")
 		return primaryErr
 	}
 
@@ -315,4 +334,9 @@ func (nsc *NodeShardedCache) GetNodeCount() int {
 	defer nsc.mu.RUnlock()
 
 	return len(nsc.nodes)
+}
+
+// ReplicaFactor 获取当前的副本因子
+func (nsc *NodeShardedCache) ReplicaFactor() int {
+	return nsc.replicaFactor
 }
