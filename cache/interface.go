@@ -49,14 +49,6 @@ type ShardedCache interface {
 	GetNodeCount() int
 }
 
-// DataSource 数据源接口
-// 表示read through和write through中的数据来源
-type DataSource interface {
-	Load(ctx context.Context, key string) (any, error)
-	Store(ctx context.Context, key string, val any) error
-	Remove(ctx context.Context, key string) error
-}
-
 //=================== 节点通信相关接口 ===================
 
 // NodeMessage 节点间通信消息
