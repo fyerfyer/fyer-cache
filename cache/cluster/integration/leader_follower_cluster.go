@@ -63,6 +63,15 @@ type LeaderFollowerCluster struct {
 // LeaderFollowerClusterOption 配置选项函数
 type LeaderFollowerClusterOption func(*LeaderFollowerCluster)
 
+// WithSyncerAddress 设置同步器地址
+func WithSyncerAddress(syncerAddr string) LeaderFollowerClusterOption {
+	return func(lfc *LeaderFollowerCluster) {
+		if lfc.config != nil {
+			lfc.config.SyncerAddress = syncerAddr
+		}
+	}
+}
+
 // WithInitialRole 设置初始角色
 func WithInitialRole(role replication.ReplicationRole) LeaderFollowerClusterOption {
 	return func(lfc *LeaderFollowerCluster) {
@@ -107,12 +116,13 @@ func NewLeaderFollowerCluster(
 	config := replication.DefaultReplicationConfig()
 	config.NodeID = nodeID
 	config.Address = address
+	config.SyncerAddress = "" // 默认为空，会由选项函数设置
 
 	// 创建复制日志
 	log := replication.NewMemoryReplicationLog()
 
 	// 创建数据同步器
-	syncer := replication.NewMemorySyncer(nodeID, localCache, log)
+	syncer := replication.NewMemorySyncer(nodeID, localCache, log, replication.WithAddress(address))
 
 	// 创建集群实例
 	lfc := &LeaderFollowerCluster{
@@ -120,7 +130,6 @@ func NewLeaderFollowerCluster(
 		address:     address,
 		localCache:  localCache,
 		log:         log,
-		syncer:      syncer,
 		currentRole: replication.RoleFollower, // 默认为Follower
 		config:      config,
 		stopCh:      make(chan struct{}),
@@ -131,6 +140,16 @@ func NewLeaderFollowerCluster(
 	for _, opt := range options {
 		opt(lfc)
 	}
+
+	// 如果没有设置同步器地址，使用集群地址
+    if lfc.config.SyncerAddress == "" {
+        lfc.config.SyncerAddress = address
+    }
+
+	// 创建数据同步器
+    lfc.syncer = replication.NewMemorySyncer(nodeID, localCache, lfc.log,
+        replication.WithNodeID(nodeID),
+        replication.WithAddress(lfc.config.SyncerAddress))
 
 	// 根据初始角色创建相应的节点
 	if lfc.currentRole == replication.RoleLeader {

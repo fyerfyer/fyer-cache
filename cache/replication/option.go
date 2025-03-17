@@ -62,6 +62,9 @@ type ReplicationConfig struct {
 
 	// 选举优先级，值越大优先级越高
 	Priority int
+
+	// 同步器地址
+	SyncerAddress string
 }
 
 // DefaultReplicationConfig 返回默认复制配置
