@@ -271,8 +271,9 @@ func TestFollowerNodeImpl_ApplyEntry(t *testing.T) {
 	assert.NoError(t, err)
 
 	// 验证键已删除
-	_, err = cache.Get(ctx, "testkey")
-	assert.Error(t, err)
+	val, err = cache.Get(ctx, "testkey")
+	assert.NoError(t, err)
+	assert.Nil(t, val)
 
 	// 测试应用空条目
 	err = follower.ApplyEntry(ctx, nil)
