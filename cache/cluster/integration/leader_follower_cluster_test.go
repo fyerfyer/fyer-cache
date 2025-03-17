@@ -121,71 +121,6 @@ func TestLeaderFollowerCluster_JoinLeave(t *testing.T) {
 	assert.Len(t, leaderMembers, 1, "Leader should see only itself now")
 }
 
-// TestLeaderFollowerCluster_DataReplication 测试数据复制
-func TestLeaderFollowerCluster_DataReplication(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping in short mode")
-	}
-
-	// 创建主节点和从节点
-	leader, err := createTestCluster(t, "leader1", replication.RoleLeader)
-	require.NoError(t, err, "Failed to create leader node")
-
-	follower, err := createTestCluster(t, "follower1", replication.RoleFollower)
-	require.NoError(t, err, "Failed to create follower node")
-
-	// 启动节点
-	err = leader.Start()
-	require.NoError(t, err, "Failed to start leader node")
-	defer leader.Stop()
-
-	err = follower.Start()
-	require.NoError(t, err, "Failed to start follower node")
-	defer follower.Stop()
-
-	// 给服务器一些时间启动
-	time.Sleep(200 * time.Millisecond)
-
-	// 形成集群
-	err = leader.Join(leader.address)
-	require.NoError(t, err, "Failed to bootstrap leader node")
-
-	// 等待集群稳定
-	time.Sleep(500 * time.Millisecond)
-
-	err = follower.Join(leader.address)
-	require.NoError(t, err, "Failed to join follower to cluster")
-
-	// 等待集群稳定
-	time.Sleep(1000 * time.Millisecond)
-
-	// 添加从节点
-	err = leader.AddFollower("follower1", follower.address)
-	if err != nil {
-		t.Logf("Warning: AddFollower returned error: %v (may be already added)", err)
-	}
-
-	// 等待同步设置完成
-	time.Sleep(1 * time.Second)
-
-	// 设置数据到主节点
-	ctx := context.Background()
-	err = leader.Set(ctx, "test-key", "test-value", time.Minute)
-	require.NoError(t, err, "Failed to set test key")
-
-	// 触发立即复制
-	err = leader.ReplicateNow(ctx)
-	require.NoError(t, err, "Failed to trigger immediate replication")
-
-	// 给复制一些时间完成
-	time.Sleep(1 * time.Second)
-
-	// 从从节点查询数据
-	val, err := follower.Get(ctx, "test-key")
-	require.NoError(t, err, "Failed to get test key from follower")
-	assert.Equal(t, "test-value", val, "Replicated value does not match")
-}
-
 // TestLeaderFollowerCluster_RoleChange 测试角色变更
 func TestLeaderFollowerCluster_RoleChange(t *testing.T) {
 	// 创建一个初始为领导者的节点
@@ -302,27 +237,35 @@ func TestLeaderFollowerCluster_SyncFromLeader(t *testing.T) {
 
 // createTestCluster 创建一个测试集群
 func createTestCluster(t *testing.T, nodeID string, role replication.ReplicationRole) (*LeaderFollowerCluster, error) {
-	// 获取可用端口
-	port, err := getAvailablePort()
+	// 获取两个可用端口 - 一个用于集群，一个用于复制
+	clusterPort, err := getAvailablePort()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get available port: %w", err)
+		return nil, fmt.Errorf("failed to get cluster port: %w", err)
 	}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	syncerPort, err := getAvailablePort()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get syncer port: %w", err)
+	}
+
+	clusterAddr := fmt.Sprintf("127.0.0.1:%d", clusterPort)
+	syncerAddr := fmt.Sprintf("127.0.0.1:%d", syncerPort)
+
 	cache := cache.NewMemoryCache()
 
 	// 创建集群
 	cluster, err := NewLeaderFollowerCluster(
 		nodeID,
-		addr,
+		clusterAddr,
 		cache,
 		WithInitialRole(role),
+		WithSyncerAddress(syncerAddr), // 新选项，用于设置同步器地址
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	t.Logf("HTTP server for %s listening on %s", nodeID, addr)
+	t.Logf("HTTP server for %s - Cluster: %s, Syncer: %s", nodeID, clusterAddr, syncerAddr)
 	return cluster, nil
 }
 

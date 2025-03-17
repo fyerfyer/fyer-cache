@@ -414,18 +414,10 @@ func (s *MemorySyncer) CleanupExpiredEntries(ctx context.Context, maxAge time.Du
 }
 
 // StartHTTPServer 启动同步 HTTP 服务器
-// StartHTTPServer 启动同步 HTTP 服务器
 func (s *MemorySyncer) StartHTTPServer() error {
 	// 先检查是否已经有服务运行
 	if s.httpServer != nil {
-		// 尝试停止现有的 HTTP 服务器，避免重复绑定同一端口
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := s.httpServer.Shutdown(ctx); err != nil {
-			fmt.Printf("Error shutting down existing HTTP server: %v\n", err)
-			// 继续执行，尝试创建新服务器
-		}
+		return nil // Server already running
 	}
 
 	// 创建新的 mux 或复用现有的
@@ -480,21 +472,22 @@ func (s *MemorySyncer) StartHTTPServer() error {
 	})
 
 	// 创建新的 HTTP 服务器
+	addr := s.config.Address
+	fmt.Printf("Starting replicate HTTP server at %s (node: %s)\n", addr, s.nodeID)
 	s.httpServer = &http.Server{
-		Addr:    s.config.Address,
+		Addr:    addr,
 		Handler: s.mux,
 	}
 
-	// 启动 HTTP 服务器
+	// 启动 HTTP 服务器 (使用goroutine)
 	go func() {
-		fmt.Printf("Starting replicate HTTP server at %s (node: %s)\n", s.config.Address, s.nodeID)
 		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("HTTP server error: %v\n", err)
 		}
 	}()
 
-	// 等待服务器启动
-	fmt.Printf("HTTP server for %s listening on %s\n", s.nodeID, s.config.Address)
+	// 等待服务器启动 (添加短暂延迟让服务器有时间启动)
+	time.Sleep(100 * time.Millisecond)
 
 	return nil
 }
