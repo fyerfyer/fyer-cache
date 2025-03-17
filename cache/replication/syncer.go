@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -41,6 +42,11 @@ type MemorySyncer struct {
 
 	// 停止信号通道
 	stopCh chan struct{}
+
+	// HTTP服务器相关
+	httpServer *http.Server
+	mux        *http.ServeMux
+	serverPort int32 // 使用atomic操作访问
 }
 
 // NewMemorySyncer 创建新的内存同步器
@@ -83,20 +89,42 @@ func (s *MemorySyncer) Start() error {
 	// 启动后台处理协程
 	go s.processLogEntries()
 
+	// 启动 HTTP 服务器
+	if err := s.StartHTTPServer(); err != nil {
+		s.running = false
+		return fmt.Errorf("failed to start HTTP server: %w", err)
+	}
+
 	return nil
 }
 
 // Stop 停止同步器
-func (s *MemorySyncer) Stop() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (ms *MemorySyncer) Stop() error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
 
-	if !s.running {
+	if !ms.running {
 		return nil
 	}
 
-	close(s.stopCh)
-	s.running = false
+	// 关闭HTTP服务器
+	if ms.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := ms.httpServer.Shutdown(ctx); err != nil {
+			fmt.Printf("HTTP server close error: %v\n", err)
+		}
+	}
+
+	// 安全关闭通道
+	select {
+	case <-ms.stopCh:
+		// 已关闭
+	default:
+		close(ms.stopCh)
+	}
+
+	ms.running = false
 	return nil
 }
 
@@ -182,16 +210,17 @@ func (s *MemorySyncer) syncWithRetries(ctx context.Context, target string, req *
 // sendSyncRequest 发送同步请求
 func (s *MemorySyncer) sendSyncRequest(ctx context.Context, target string, req *SyncRequest) error {
 	// 序列化请求
-	_, err := json.Marshal(req)
+	reqBody, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("failed to marshal sync request: %w", err)
 	}
 
-	// 构建URL
+	// 构建URL - 添加调试日志
 	url := fmt.Sprintf("http://%s/replication/sync", target)
+	fmt.Printf("Sending sync request to: %s\n", url)
 
 	// 创建请求
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
 	}
@@ -354,47 +383,6 @@ func (s *MemorySyncer) RecordDelOperation(key string, term uint64) error {
 	return nil
 }
 
-// HandleSyncRequest 处理来自从节点的同步请求
-func (s *MemorySyncer) HandleSyncRequest(ctx context.Context, req *SyncRequest) (*SyncResponse, error) {
-	resp := &SyncResponse{
-		Success: true,
-		Entries: []*ReplicationEntry{},
-	}
-
-	// 判断是全量同步还是增量同步
-	if req.FullSync {
-		// 全量同步 - 获取所有日志条目
-		entries, err := s.log.GetFrom(1, s.config.MaxLogEntries)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get log entries for full sync: %w", err)
-		}
-
-		resp.Entries = entries
-
-		// 如果还有更多条目
-		if len(entries) > 0 && len(entries) == s.config.MaxLogEntries {
-			lastEntry := entries[len(entries)-1]
-			resp.NextIndex = lastEntry.Index + 1
-		}
-	} else {
-		// 增量同步 - 获取从指定索引开始的日志条目
-		entries, err := s.log.GetFrom(req.LastLogIndex, s.config.MaxLogEntries)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get log entries for incremental sync: %w", err)
-		}
-
-		resp.Entries = entries
-
-		// 如果还有更多条目
-		if len(entries) > 0 && len(entries) == s.config.MaxLogEntries {
-			lastEntry := entries[len(entries)-1]
-			resp.NextIndex = lastEntry.Index + 1
-		}
-	}
-
-	return resp, nil
-}
-
 // CleanupExpiredEntries 清理过期的日志条目
 func (s *MemorySyncer) CleanupExpiredEntries(ctx context.Context, maxAge time.Duration) error {
 	// 获取所有日志条目
@@ -423,4 +411,122 @@ func (s *MemorySyncer) CleanupExpiredEntries(ctx context.Context, maxAge time.Du
 	}
 
 	return nil
+}
+
+// StartHTTPServer 启动同步 HTTP 服务器
+// StartHTTPServer 启动同步 HTTP 服务器
+func (s *MemorySyncer) StartHTTPServer() error {
+	// 先检查是否已经有服务运行
+	if s.httpServer != nil {
+		// 尝试停止现有的 HTTP 服务器，避免重复绑定同一端口
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := s.httpServer.Shutdown(ctx); err != nil {
+			fmt.Printf("Error shutting down existing HTTP server: %v\n", err)
+			// 继续执行，尝试创建新服务器
+		}
+	}
+
+	// 创建新的 mux 或复用现有的
+	if s.mux == nil {
+		s.mux = http.NewServeMux()
+	}
+
+	// 清除旧的处理程序并重新注册
+	s.mux = http.NewServeMux()
+
+	// 注册同步处理程序
+	s.mux.HandleFunc("/replication/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			return
+		}
+
+		var req SyncRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		ctx := r.Context()
+		resp, err := s.HandleSyncRequest(ctx, &req)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to handle sync request: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		respBody, err := json.Marshal(resp)
+		if err != nil {
+			http.Error(w, "Failed to marshal response", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(respBody)
+	})
+
+	// 添加健康检查端点
+	s.mux.HandleFunc("/replication/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	// 创建新的 HTTP 服务器
+	s.httpServer = &http.Server{
+		Addr:    s.config.Address,
+		Handler: s.mux,
+	}
+
+	// 启动 HTTP 服务器
+	go func() {
+		fmt.Printf("Starting replicate HTTP server at %s (node: %s)\n", s.config.Address, s.nodeID)
+		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("HTTP server error: %v\n", err)
+		}
+	}()
+
+	// 等待服务器启动
+	fmt.Printf("HTTP server for %s listening on %s\n", s.nodeID, s.config.Address)
+
+	return nil
+}
+
+// HandleSyncRequest 处理来自从节点的同步请求
+func (s *MemorySyncer) HandleSyncRequest(ctx context.Context, req *SyncRequest) (*SyncResponse, error) {
+	// 准备响应
+	resp := &SyncResponse{
+		Success:   true,
+		Entries:   make([]*ReplicationEntry, 0),
+		NextIndex: req.LastLogIndex,
+	}
+
+	// 判断是全量同步还是增量同步
+	startIndex := req.LastLogIndex
+	if req.FullSync {
+		startIndex = 0 // 全量同步从0开始
+	}
+
+	// 获取日志条目
+	entries, err := s.log.GetFrom(startIndex+1, s.config.MaxLogEntries)
+	if err != nil && startIndex > 0 { // 如果不是因为没有条目导致的错误
+		return nil, fmt.Errorf("failed to get log entries: %w", err)
+	}
+
+	if len(entries) > 0 {
+		resp.Entries = entries
+		resp.NextIndex = entries[len(entries)-1].Index
+	} else {
+		// 没有新条目
+		resp.NextIndex = s.log.GetLastIndex()
+	}
+
+	return resp, nil
 }

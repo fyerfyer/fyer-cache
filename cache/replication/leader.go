@@ -167,10 +167,10 @@ func (l *LeaderNodeImpl) GetLeader() string {
 // AddFollower 添加从节点
 func (l *LeaderNodeImpl) AddFollower(nodeID string, address string) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	// 检查是否已存在
 	if _, exists := l.followers[nodeID]; exists {
+		l.mu.Unlock()
 		return fmt.Errorf("follower '%s' already exists", nodeID)
 	}
 
@@ -178,12 +178,16 @@ func (l *LeaderNodeImpl) AddFollower(nodeID string, address string) error {
 	l.followers[nodeID] = address
 	l.followerStatus[nodeID] = StateOutOfSync
 
+	// 复制地址用于goroutine
+	targetAddress := address
+	l.mu.Unlock()
+
 	// 触发全量同步
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), l.config.ReplicationTimeout)
 		defer cancel()
 
-		err := l.syncer.FullSync(ctx, address)
+		err := l.syncer.FullSync(ctx, targetAddress)
 
 		// 更新状态
 		l.mu.Lock()
@@ -230,16 +234,22 @@ func (l *LeaderNodeImpl) GetFollowers() map[string]string {
 
 // ReplicateEntries 复制日志条目到所有从节点
 func (l *LeaderNodeImpl) ReplicateEntries(ctx context.Context) error {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
 	// 检查是否为Leader
+	l.mu.RLock()
 	if l.role != RoleLeader {
+		l.mu.RUnlock()
 		return errors.New("not the leader")
 	}
 
+	// 复制从节点信息以避免在整个操作期间持有锁
+	followers := make(map[string]string, len(l.followers))
+	for nodeID, addr := range l.followers {
+		followers[nodeID] = addr
+	}
+	l.mu.RUnlock()
+
 	// 检查是否有从节点
-	if len(l.followers) == 0 {
+	if len(followers) == 0 {
 		return nil // 没有从节点，视为成功
 	}
 
@@ -248,7 +258,7 @@ func (l *LeaderNodeImpl) ReplicateEntries(ctx context.Context) error {
 	var syncErrorsMu sync.Mutex
 
 	// 对每个从节点执行增量同步
-	for nodeID, addr := range l.followers {
+	for nodeID, addr := range followers {
 		wg.Add(1)
 		go func(id string, address string) {
 			defer wg.Done()
@@ -263,12 +273,12 @@ func (l *LeaderNodeImpl) ReplicateEntries(ctx context.Context) error {
 				syncErrors = append(syncErrors, fmt.Errorf("sync to %s failed: %w", id, err))
 				syncErrorsMu.Unlock()
 
-				// 更新状态
+				// 更新状态 - 使用单独的加锁区域
 				l.mu.Lock()
 				l.followerStatus[id] = StateOutOfSync
 				l.mu.Unlock()
 			} else {
-				// 更新状态
+				// 更新状态 - 使用单独的加锁区域
 				l.mu.Lock()
 				l.followerStatus[id] = StateNormal
 				l.mu.Unlock()

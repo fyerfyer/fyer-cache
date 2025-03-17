@@ -220,8 +220,9 @@ func TestLeaderNodeImpl_ApplyEntry(t *testing.T) {
 	assert.NoError(t, err)
 
 	// 验证键已删除
-	_, err = cache.Get(ctx, "testkey")
-	assert.Error(t, err)
+	val, err = cache.Get(ctx, "testkey")
+	assert.NoError(t, err)
+	assert.Nil(t, val)
 
 	// 测试应用空条目
 	err = leader.ApplyEntry(ctx, nil)
@@ -259,6 +260,10 @@ type stubResponseSyncer struct {
 }
 
 func (s *stubResponseSyncer) IncrementalSync(ctx context.Context, target string, startIndex uint64) error {
+	return s.syncError
+}
+
+func (s *stubResponseSyncer) FullSync(ctx context.Context, target string) error {
 	return s.syncError
 }
 
