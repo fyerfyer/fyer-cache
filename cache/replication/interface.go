@@ -59,6 +59,8 @@ type ReplicationEntry struct {
 	Expiration time.Duration
 	// Timestamp 操作时间戳
 	Timestamp time.Time
+	// ValueType 存储值类型
+	ValueType  string // "string", "int", "bytes", etc.
 }
 
 // ReplicationLog 复制日志接口
@@ -207,6 +209,12 @@ type Syncer interface {
 
 	// Stop 停止同步服务
 	Stop() error
+
+	// RecordSetOperation 记录Set操作到日志
+	RecordSetOperation(key string, value []byte, expiration time.Duration, term uint64) error
+
+	// RecordDelOperation 记录Del操作到日志
+	RecordDelOperation(key string, term uint64) error
 }
 
 // ReplicationEvent 复制事件

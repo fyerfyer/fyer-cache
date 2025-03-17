@@ -167,6 +167,8 @@ func (s *MemorySyncer) IncrementalSync(ctx context.Context, target string, start
 		FullSync:     false,
 	}
 
+	fmt.Printf("[%s] IncrementalSync - Starting from index: %d\n", s.nodeID, startIndex)
+
 	// 进行同步
 	return s.syncWithRetries(ctx, target, req)
 }
@@ -299,21 +301,27 @@ func (s *MemorySyncer) ApplySync(ctx context.Context, entries []*ReplicationEntr
 }
 
 // applyEntryToLocal 应用日志条目到本地缓存
+// applyEntryToLocal 应用日志条目到本地缓存
 func (s *MemorySyncer) applyEntryToLocal(ctx context.Context, entry *ReplicationEntry) error {
 	if entry == nil {
-		return errors.New("cannot apply nil entry")
+		return errors.New("nil entry")
 	}
+
+	fmt.Printf("[%s] Applying entry: cmd=%s, key=%s\n", s.nodeID, entry.Command, entry.Key)
 
 	// 根据命令类型执行不同操作
 	switch entry.Command {
 	case "Set":
-		// 设置键值
-		return s.localCache.Set(ctx, entry.Key, entry.Value, entry.Expiration)
+		var value interface{} = entry.Value // default to byte array
 
+		// Convert based on the stored type information
+		if entry.ValueType == "string" {
+			value = string(entry.Value)
+		}
+
+		return s.localCache.Set(ctx, entry.Key, value, entry.Expiration)
 	case "Del":
-		// 删除键
 		return s.localCache.Del(ctx, entry.Key)
-
 	default:
 		return fmt.Errorf("unknown command: %s", entry.Command)
 	}
@@ -326,6 +334,7 @@ func (s *MemorySyncer) RecordSetOperation(key string, value []byte, expiration t
 		Command:    "Set",
 		Key:        key,
 		Value:      value,
+		ValueType:  "string",
 		Expiration: expiration,
 		Timestamp:  time.Now(),
 	}
@@ -465,6 +474,42 @@ func (s *MemorySyncer) StartHTTPServer() error {
 		w.Write(respBody)
 	})
 
+	s.mux.HandleFunc("/replication/receive", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			return
+		}
+
+		var resp SyncResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			http.Error(w, "Failed to unmarshal sync response", http.StatusBadRequest)
+			return
+		}
+
+		ctx := r.Context()
+
+		// 记录接收到的条目
+		fmt.Printf("[%s] Received %d entries from leader\n", s.nodeID, len(resp.Entries))
+		for i, entry := range resp.Entries {
+			fmt.Printf("[%s] Entry %d: cmd=%s, key=%s\n", s.nodeID, i, entry.Command, entry.Key)
+		}
+
+		// 应用同步数据
+		if err := s.ApplySync(ctx, resp.Entries); err != nil {
+			http.Error(w, "Failed to apply sync entries", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
 	// 添加健康检查端点
 	s.mux.HandleFunc("/replication/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -511,6 +556,11 @@ func (s *MemorySyncer) HandleSyncRequest(ctx context.Context, req *SyncRequest) 
 	entries, err := s.log.GetFrom(startIndex+1, s.config.MaxLogEntries)
 	if err != nil && startIndex > 0 { // 如果不是因为没有条目导致的错误
 		return nil, fmt.Errorf("failed to get log entries: %w", err)
+	}
+
+	fmt.Printf("[%s] Sending %d entries in sync response\n", s.nodeID, len(entries))
+	for i, entry := range entries {
+		fmt.Printf("[%s] Entry %d: cmd=%s, key=%s\n", s.nodeID, i, entry.Command, entry.Key)
 	}
 
 	if len(entries) > 0 {

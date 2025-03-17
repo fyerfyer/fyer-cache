@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -122,7 +123,7 @@ func NewLeaderFollowerCluster(
 	log := replication.NewMemoryReplicationLog()
 
 	// 创建数据同步器
-	syncer := replication.NewMemorySyncer(nodeID, localCache, log, replication.WithAddress(address))
+	//syncer := replication.NewMemorySyncer(nodeID, localCache, log, replication.WithAddress(address))
 
 	// 创建集群实例
 	lfc := &LeaderFollowerCluster{
@@ -153,7 +154,7 @@ func NewLeaderFollowerCluster(
 
 	// 根据初始角色创建相应的节点
 	if lfc.currentRole == replication.RoleLeader {
-		lfc.leaderNode = replication.NewLeaderNode(nodeID, localCache, log, syncer,
+		lfc.leaderNode = replication.NewLeaderNode(nodeID, localCache, log, lfc.syncer,
 			replication.WithNodeID(nodeID),
 			replication.WithAddress(address),
 			replication.WithRole(replication.RoleLeader),
@@ -161,7 +162,7 @@ func NewLeaderFollowerCluster(
 			replication.WithElectionTimeout(config.ElectionTimeout),
 		)
 	} else {
-		lfc.followerNode = replication.NewFollowerNode(nodeID, localCache, log, syncer,
+		lfc.followerNode = replication.NewFollowerNode(nodeID, localCache, log, lfc.syncer,
 			replication.WithNodeID(nodeID),
 			replication.WithAddress(address),
 			replication.WithRole(replication.RoleFollower),
@@ -285,7 +286,22 @@ func (lfc *LeaderFollowerCluster) Stop() error {
 
 // Join 加入集群
 func (lfc *LeaderFollowerCluster) Join(seedAddr string) error {
-	// 先通过集群节点加入集群
+	// Fix role representation
+	roleStr := "follower" 
+	if lfc.currentRole == replication.RoleLeader {
+		roleStr = "leader"
+	}
+	
+	// Add syncer address to metadata
+	metadata := map[string]string{
+		"role": roleStr,
+		"syncer_address": lfc.config.SyncerAddress,
+	}
+	
+	// Set metadata before joining
+	lfc.clusterNode.Membership().SetLocalMetadata(metadata)
+	
+	// Join cluster
 	if err := lfc.clusterNode.Join(seedAddr); err != nil {
 		return fmt.Errorf("failed to join cluster: %w", err)
 	}
@@ -491,7 +507,7 @@ func (lfc *LeaderFollowerCluster) handleClusterEvents() {
 		case <-lfc.stopCh:
 			return
 		case event, ok := <-eventCh:
-			if !ok {
+			if (!ok) {
 				return // 通道已关闭
 			}
 
@@ -511,19 +527,34 @@ func (lfc *LeaderFollowerCluster) handleClusterEvents() {
 
 // handleNodeJoin 处理节点加入事件
 func (lfc *LeaderFollowerCluster) handleNodeJoin(event cache.ClusterEvent) {
-	// 如果当前节点是领导者，需要考虑将新节点添加为从节点
 	lfc.mu.RLock()
 	defer lfc.mu.RUnlock()
 
 	if lfc.currentRole == replication.RoleLeader && lfc.leaderNode != nil {
-		// 获取节点地址
-		addr, ok := event.Details.(string)
+		clusterAddr, ok := event.Details.(string)
 		if !ok {
 			return
 		}
 
-		// 添加从节点
-		_ = lfc.leaderNode.AddFollower(event.NodeID, addr)
+		// Log for debugging
+		fmt.Printf("Node join event: ID=%s, cluster address=%s\n", event.NodeID, clusterAddr)
+
+		members := lfc.clusterNode.Members()
+		for _, member := range members {
+			if member.ID == event.NodeID {
+				// Log metadata for debugging
+				fmt.Printf("Found member metadata: %+v\n", member.Metadata)
+
+				syncerAddr := member.Metadata["syncer_address"]
+				if syncerAddr == "" {
+					syncerAddr = clusterAddr
+				}
+
+				fmt.Printf("Using syncer address: %s\n", syncerAddr)
+				_ = lfc.leaderNode.AddFollower(event.NodeID, syncerAddr)
+				break
+			}
+		}
 	}
 }
 
@@ -586,43 +617,68 @@ func (lfc *LeaderFollowerCluster) Get(ctx context.Context, key string) (any, err
 
 // Set 设置缓存值
 func (lfc *LeaderFollowerCluster) Set(ctx context.Context, key string, val any, expiration time.Duration) error {
-	// 记录操作到同步日志
-	if lfc.currentRole == replication.RoleLeader {
-		if msync, ok := lfc.syncer.(*replication.MemorySyncer); ok {
-			value, ok := val.([]byte)
-			if !ok {
-				// 尝试转换为字节数组
-				if str, ok := val.(string); ok {
-					value = []byte(str)
-				} else {
-					// 其他类型暂不支持
-					return errors.New("only []byte and string values are supported for replication")
-				}
-			}
-
-			if err := msync.RecordSetOperation(key, value, expiration, 0); err != nil {
-				return fmt.Errorf("failed to record set operation: %w", err)
-			}
-		}
+	// 先执行本地操作
+	err := lfc.localCache.Set(ctx, key, val, expiration)
+	if err != nil {
+		return err
 	}
 
-	// 本地执行
-	return lfc.localCache.Set(ctx, key, val, expiration)
+	// 只有Leader才记录操作到同步日志
+	lfc.mu.RLock()
+	defer lfc.mu.RUnlock()
+
+	if lfc.currentRole == replication.RoleLeader && lfc.syncer != nil {
+		// 将value转换为字节
+		var valueBytes []byte
+		switch v := val.(type) {
+		case []byte:
+			valueBytes = v
+		case string:
+			valueBytes = []byte(v)
+		default:
+			// 如果不是字节或字符串，尝试JSON编码
+			data, err := json.Marshal(v)
+			if err != nil {
+				return fmt.Errorf("failed to marshal value: %w", err)
+			}
+			valueBytes = data
+		}
+
+		// 记录Set操作到同步器的日志中
+		term := uint64(1) // 简化处理，使用固定任期
+		if err := lfc.syncer.RecordSetOperation(key, valueBytes, expiration, term); err != nil {
+			return fmt.Errorf("failed to record set operation: %w", err)
+		}
+
+		fmt.Printf("[%s] Recorded SET operation for key=%s in log\n", lfc.nodeID, key)
+	}
+
+	return nil
 }
 
 // Del 删除缓存值
 func (lfc *LeaderFollowerCluster) Del(ctx context.Context, key string) error {
-	// 记录操作到同步日志
-	if lfc.currentRole == replication.RoleLeader {
-		if msync, ok := lfc.syncer.(*replication.MemorySyncer); ok {
-			if err := msync.RecordDelOperation(key, 0); err != nil {
-				return fmt.Errorf("failed to record delete operation: %w", err)
-			}
-		}
+	// 先执行本地操作
+	err := lfc.localCache.Del(ctx, key)
+	if err != nil {
+		return err
 	}
 
-	// 本地执行
-	return lfc.localCache.Del(ctx, key)
+	// 只有Leader才记录操作到同步日志
+	lfc.mu.RLock()
+	defer lfc.mu.RUnlock()
+
+	if lfc.currentRole == replication.RoleLeader && lfc.syncer != nil {
+		// 记录Del操作到同步器的日志中
+		term := uint64(1) // 简化处理，使用固定任期
+		if err := lfc.syncer.RecordDelOperation(key, term); err != nil {
+			return fmt.Errorf("failed to record delete operation: %w", err)
+		}
+
+		fmt.Printf("[%s] Recorded DEL operation for key=%s in log\n", lfc.nodeID, key)
+	}
+
+	return nil
 }
 
 // GetClusterInfo 获取集群信息
@@ -664,5 +720,6 @@ func (lfc *LeaderFollowerCluster) ReplicateNow(ctx context.Context) error {
 		return errors.New("only leader can trigger replication")
 	}
 
+	fmt.Printf("[%s] Triggering replication to followers\n", lfc.nodeID)
 	return lfc.leaderNode.ReplicateEntries(ctx)
 }
