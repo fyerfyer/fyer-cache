@@ -1,9 +1,12 @@
 package replication
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -248,6 +251,8 @@ func (l *LeaderNodeImpl) ReplicateEntries(ctx context.Context) error {
 	}
 	l.mu.RUnlock()
 
+	fmt.Printf("[%s] ReplicateEntries - Followers count: %d\n", l.nodeID, len(followers))
+
 	// 检查是否有从节点
 	if len(followers) == 0 {
 		return nil // 没有从节点，视为成功
@@ -263,26 +268,93 @@ func (l *LeaderNodeImpl) ReplicateEntries(ctx context.Context) error {
 		go func(id string, address string) {
 			defer wg.Done()
 
-			// 获取最后同步的索引
-			lastIndex := uint64(0) // 这里简化处理，实际可能需要跟踪每个节点的同步进度
+			// 获取从节点要从哪个索引开始同步
+			// 在实际实现中，需要跟踪每个节点的同步进度
+			lastIndex := uint64(0)
 
-			// 执行增量同步
-			err := l.syncer.IncrementalSync(ctx, address, lastIndex)
+			// 创建同步请求
+			//req := &SyncRequest{
+			//	LeaderID:     l.nodeID,
+			//	LastLogIndex: lastIndex,
+			//	LastLogTerm:  l.log.GetLastTerm(),
+			//	FullSync:     false,
+			//}
+
+			// 获取要发送给从节点的日志条目
+			entries, err := l.log.GetFrom(lastIndex+1, l.config.MaxLogEntries)
 			if err != nil {
 				syncErrorsMu.Lock()
-				syncErrors = append(syncErrors, fmt.Errorf("sync to %s failed: %w", id, err))
+				syncErrors = append(syncErrors, fmt.Errorf("failed to get log entries: %w", err))
 				syncErrorsMu.Unlock()
+				return
+			}
 
-				// 更新状态 - 使用单独的加锁区域
+			fmt.Printf("[%s] Sending %d entries to follower %s\n", l.nodeID, len(entries), id)
+
+			// 创建同步响应
+			resp := &SyncResponse{
+				Success:   true,
+				Entries:   entries,
+				NextIndex: l.log.GetLastIndex() + 1,
+			}
+
+			// 序列化响应
+			respBody, err := json.Marshal(resp)
+			if err != nil {
+				syncErrorsMu.Lock()
+				syncErrors = append(syncErrors, fmt.Errorf("failed to marshal sync response: %w", err))
+				syncErrorsMu.Unlock()
+				return
+			}
+
+			// 构建URL
+			url := fmt.Sprintf("http://%s/replication/receive", address)
+			
+			// 创建POST请求
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(respBody))
+			if err != nil {
+				syncErrorsMu.Lock()
+				syncErrors = append(syncErrors, fmt.Errorf("failed to create HTTP request: %w", err))
+				syncErrorsMu.Unlock()
+				return
+			}
+			
+			// 设置请求头
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("X-Node-ID", l.nodeID)
+			
+			// 发送请求
+			httpResp, err := http.DefaultClient.Do(httpReq)
+			if err != nil {
+				syncErrorsMu.Lock()
+				syncErrors = append(syncErrors, fmt.Errorf("failed to send sync data to %s: %w", id, err))
+				syncErrorsMu.Unlock()
+				
+				// 更新状态
 				l.mu.Lock()
 				l.followerStatus[id] = StateOutOfSync
 				l.mu.Unlock()
-			} else {
-				// 更新状态 - 使用单独的加锁区域
-				l.mu.Lock()
-				l.followerStatus[id] = StateNormal
-				l.mu.Unlock()
+				return
 			}
+			defer httpResp.Body.Close()
+			
+			// 检查响应
+			if httpResp.StatusCode != http.StatusOK {
+				syncErrorsMu.Lock()
+				syncErrors = append(syncErrors, fmt.Errorf("follower %s returned non-OK status: %s", id, httpResp.Status))
+				syncErrorsMu.Unlock()
+				
+				// 更新状态
+				l.mu.Lock()
+				l.followerStatus[id] = StateOutOfSync
+				l.mu.Unlock()
+				return
+			}
+			
+			// 更新状态
+			l.mu.Lock()
+			l.followerStatus[id] = StateNormal
+			l.mu.Unlock()
 		}(nodeID, addr)
 	}
 

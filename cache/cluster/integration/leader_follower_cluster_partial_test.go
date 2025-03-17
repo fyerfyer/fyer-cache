@@ -127,7 +127,7 @@ func TestLeaderFollowerCluster_SimpleDataReplication(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Add follower explicitly (this should happen during Join but we're being explicit)
-	err = leader.AddFollower(follower.nodeID, follower.address)
+	err = leader.AddFollower(follower.nodeID, follower.config.SyncerAddress)
 	require.NoError(t, err)
 
 	// Let sync setup complete
