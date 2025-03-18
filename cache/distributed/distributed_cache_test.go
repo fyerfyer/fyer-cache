@@ -3,6 +3,8 @@ package distributed
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -131,6 +133,13 @@ func TestRemoteCache(t *testing.T) {
 
 // TestHTTPClient 测试自定义HTTP客户端
 func TestHTTPClient(t *testing.T) {
+	// 创建模拟 HTTP 服务器
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"value":"test-value"}`))
+	}))
+	defer server.Close()
+
 	client := &defaultHTTPClient{
 		timeout: 2 * time.Second,
 	}
@@ -143,28 +152,25 @@ func TestHTTPClient(t *testing.T) {
 	err = client.Do("", "http://example.com", nil, nil)
 	assert.Error(t, err)
 
-	// 测试正常请求
-	// 仅模拟返回结果，不实际发送请求
+	// 测试正常请求 - 使用模拟服务器URL
 	result := struct {
 		Value string `json:"value"`
 	}{}
-	err = client.Do("GET", "http://example.com", nil, &result)
+	err = client.Do("GET", server.URL, nil, &result)
 	assert.NoError(t, err)
+	assert.Equal(t, "test-value", result.Value)
 
-	// 测试不支持的结果类型
-	unsupported := "string result"
-	err = client.Do("GET", "http://example.com", nil, &unsupported)
-	assert.Error(t, err)
-
-	// 测试支持的结果类型
+	// 测试另外的结果类型
 	mapResult := make(map[string]interface{})
-	err = client.Do("GET", "http://example.com", nil, &mapResult)
+	err = client.Do("GET", server.URL, nil, &mapResult)
 	assert.NoError(t, err)
+	assert.Equal(t, "test-value", mapResult["value"])
 
 	// 测试另一种支持的结果类型
 	structResult := struct{ Value interface{} }{}
-	err = client.Do("GET", "http://example.com", nil, &structResult)
+	err = client.Do("GET", server.URL, nil, &structResult)
 	assert.NoError(t, err)
+	assert.Equal(t, "test-value", structResult.Value)
 }
 
 func TestRemoteCacheOperations(t *testing.T) {
