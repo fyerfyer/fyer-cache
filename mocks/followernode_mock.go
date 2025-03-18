@@ -360,6 +360,40 @@ func (_c *FollowerNode_RequestSync_Call) RunAndReturn(run func(context.Context, 
 	return _c
 }
 
+// SetLeader provides a mock function with given fields: leaderID, address
+func (_m *FollowerNode) SetLeader(leaderID string, address string) {
+	_m.Called(leaderID, address)
+}
+
+// FollowerNode_SetLeader_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'SetLeader'
+type FollowerNode_SetLeader_Call struct {
+	*mock.Call
+}
+
+// SetLeader is a helper method to define mock.On call
+//   - leaderID string
+//   - address string
+func (_e *FollowerNode_Expecter) SetLeader(leaderID interface{}, address interface{}) *FollowerNode_SetLeader_Call {
+	return &FollowerNode_SetLeader_Call{Call: _e.mock.On("SetLeader", leaderID, address)}
+}
+
+func (_c *FollowerNode_SetLeader_Call) Run(run func(leaderID string, address string)) *FollowerNode_SetLeader_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(string), args[1].(string))
+	})
+	return _c
+}
+
+func (_c *FollowerNode_SetLeader_Call) Return() *FollowerNode_SetLeader_Call {
+	_c.Call.Return()
+	return _c
+}
+
+func (_c *FollowerNode_SetLeader_Call) RunAndReturn(run func(string, string)) *FollowerNode_SetLeader_Call {
+	_c.Run(run)
+	return _c
+}
+
 // SetRole provides a mock function with given fields: role
 func (_m *FollowerNode) SetRole(role replication.ReplicationRole) {
 	_m.Called(role)

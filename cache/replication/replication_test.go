@@ -156,6 +156,16 @@ type mockSyncer struct {
 	stopCalled  bool
 }
 
+func (m *mockSyncer) RecordSetOperation(key string, value []byte, expiration time.Duration, term uint64) error {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (m *mockSyncer) RecordDelOperation(key string, term uint64) error {
+	//TODO implement me
+	panic("implement me")
+}
+
 func (m *mockSyncer) Start() error {
 	m.startCalled = true
 	return nil

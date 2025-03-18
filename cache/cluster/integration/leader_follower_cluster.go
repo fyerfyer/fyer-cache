@@ -122,9 +122,6 @@ func NewLeaderFollowerCluster(
 	// 创建复制日志
 	log := replication.NewMemoryReplicationLog()
 
-	// 创建数据同步器
-	//syncer := replication.NewMemorySyncer(nodeID, localCache, log, replication.WithAddress(address))
-
 	// 创建集群实例
 	lfc := &LeaderFollowerCluster{
 		nodeID:      nodeID,
@@ -286,22 +283,20 @@ func (lfc *LeaderFollowerCluster) Stop() error {
 
 // Join 加入集群
 func (lfc *LeaderFollowerCluster) Join(seedAddr string) error {
-	// Fix role representation
 	roleStr := "follower" 
 	if lfc.currentRole == replication.RoleLeader {
 		roleStr = "leader"
 	}
-	
-	// Add syncer address to metadata
+
+	// 在元数据中添加同步器地址
 	metadata := map[string]string{
 		"role": roleStr,
 		"syncer_address": lfc.config.SyncerAddress,
 	}
 	
-	// Set metadata before joining
+	// 在加入集群前，先设置元数据
 	lfc.clusterNode.Membership().SetLocalMetadata(metadata)
-	
-	// Join cluster
+
 	if err := lfc.clusterNode.Join(seedAddr); err != nil {
 		return fmt.Errorf("failed to join cluster: %w", err)
 	}
@@ -536,14 +531,13 @@ func (lfc *LeaderFollowerCluster) handleNodeJoin(event cache.ClusterEvent) {
 			return
 		}
 
-		// Log for debugging
-		fmt.Printf("Node join event: ID=%s, cluster address=%s\n", event.NodeID, clusterAddr)
+		//fmt.Printf("Node join event: ID=%s, cluster address=%s\n", event.NodeID, clusterAddr)
 
 		members := lfc.clusterNode.Members()
 		for _, member := range members {
 			if member.ID == event.NodeID {
 				// Log metadata for debugging
-				fmt.Printf("Found member metadata: %+v\n", member.Metadata)
+				//fmt.Printf("Found member metadata: %+v\n", member.Metadata)
 
 				syncerAddr := member.Metadata["syncer_address"]
 				if syncerAddr == "" {
@@ -720,6 +714,6 @@ func (lfc *LeaderFollowerCluster) ReplicateNow(ctx context.Context) error {
 		return errors.New("only leader can trigger replication")
 	}
 
-	fmt.Printf("[%s] Triggering replication to followers\n", lfc.nodeID)
+	//fmt.Printf("[%s] Triggering replication to followers\n", lfc.nodeID)
 	return lfc.leaderNode.ReplicateEntries(ctx)
 }

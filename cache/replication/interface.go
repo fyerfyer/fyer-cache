@@ -191,6 +191,9 @@ type FollowerNode interface {
 	
 	// PromoteToLeader 提升为领导者
 	PromoteToLeader(ctx context.Context) error
+
+	// SetLeader 设置 Leader 的 ID 与 访问地址
+	SetLeader(leaderID string, address string)
 }
 
 // Syncer 数据同步接口
