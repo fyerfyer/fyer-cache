@@ -340,3 +340,24 @@ func (nsc *NodeShardedCache) GetNodeCount() int {
 func (nsc *NodeShardedCache) ReplicaFactor() int {
 	return nsc.replicaFactor
 }
+
+// GetClusterInfo 获取集群信息
+func (nsc *NodeShardedCache) GetClusterInfo() map[string]interface{} {
+	nsc.mu.RLock()
+	defer nsc.mu.RUnlock()
+
+	info := make(map[string]interface{})
+
+	// 基本信息
+	info["node_count"] = len(nsc.nodes)
+	info["replica_factor"] = nsc.replicaFactor
+
+	// 节点列表
+	nodeList := make([]string, 0, len(nsc.nodes))
+	for nodeID := range nsc.nodes {
+		nodeList = append(nodeList, nodeID)
+	}
+	info["nodes"] = nodeList
+
+	return info
+}

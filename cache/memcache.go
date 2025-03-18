@@ -23,6 +23,7 @@ type MemoryCache struct {
 	workerCount     int           // 工作协程数量
 	queueSize       int           // 任务队列大小
 	cleanupInterval time.Duration // 清理间隔
+	stats *StatsCollector         // 统计收集器
 }
 
 // cacheItem 缓存项结构
@@ -39,6 +40,7 @@ func NewMemoryCache(options ...Option) *MemoryCache {
 		workerCount:     runtime.NumCPU(),
 		queueSize:       DefaultQueueSize,
 		useAsyncCleanup: false,
+		stats: NewStatsCollector(),
 		cleanupInterval: cleanupInterval, // 添加默认清理间隔字段
 	}
 
@@ -91,6 +93,7 @@ func (c *MemoryCache) Set(ctx context.Context, key string, value any, expiration
 func (c *MemoryCache) Get(ctx context.Context, key string) (any, error) {
 	value, ok := c.data.Load(key)
 	if !ok {
+		c.stats.RecordMiss()
 		return nil, ferr.ErrKeyNotFound
 	}
 
@@ -100,9 +103,11 @@ func (c *MemoryCache) Get(ctx context.Context, key string) (any, error) {
 		if c.onEvict != nil {
 			c.onEvict(key, item.value)
 		}
+		c.stats.RecordMiss()
 		return nil, ferr.ErrKeyNotFound
 	}
 
+	c.stats.RecordHit()
 	return item.value, nil
 }
 
@@ -204,4 +209,31 @@ func (c *MemoryCache) Close() error {
 	}
 
 	return nil
+}
+
+// ItemCount 获取缓存项目数量
+func (c *MemoryCache) ItemCount() int64 {
+	return int64(c.data.Count())
+}
+
+// HitRate 获取缓存命中率
+func (c *MemoryCache) HitRate() float64 {
+	if c.stats == nil {
+		return 0
+	}
+	return c.stats.HitRate()
+}
+
+// MissRate 获取缓存未命中率
+func (c *MemoryCache) MissRate() float64 {
+	if c.stats == nil {
+		return 0
+	}
+	return c.stats.MissRate()
+}
+
+// MemoryUsage 获取内存使用情况
+func (c *MemoryCache) MemoryUsage() int64 {
+	// 基本内存缓存不追踪内存使用
+	return 0
 }
