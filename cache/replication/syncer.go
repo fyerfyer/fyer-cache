@@ -301,7 +301,6 @@ func (s *MemorySyncer) ApplySync(ctx context.Context, entries []*ReplicationEntr
 }
 
 // applyEntryToLocal 应用日志条目到本地缓存
-// applyEntryToLocal 应用日志条目到本地缓存
 func (s *MemorySyncer) applyEntryToLocal(ctx context.Context, entry *ReplicationEntry) error {
 	if entry == nil {
 		return errors.New("nil entry")
@@ -312,9 +311,9 @@ func (s *MemorySyncer) applyEntryToLocal(ctx context.Context, entry *Replication
 	// 根据命令类型执行不同操作
 	switch entry.Command {
 	case "Set":
-		var value interface{} = entry.Value // default to byte array
+		var value interface{} = entry.Value
 
-		// Convert based on the stored type information
+		// 根据类型信息，将 value 进行转换
 		if entry.ValueType == "string" {
 			value = string(entry.Value)
 		}
