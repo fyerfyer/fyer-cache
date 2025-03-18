@@ -1,10 +1,13 @@
 package distributed
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"reflect"
+	"io"
+	"log"
+	"net/http"
 	"time"
 
 	"github.com/fyerfyer/fyer-cache/internal/ferr"
@@ -18,6 +21,7 @@ type RemoteCache struct {
 	timeout  time.Duration
 	retries  int
 	interval time.Duration
+	debugLog bool
 }
 
 // RemoteCacheOption 配置选项函数
@@ -41,6 +45,13 @@ func WithRetry(retries int, interval time.Duration) RemoteCacheOption {
 		if interval > 0 {
 			rc.interval = interval
 		}
+	}
+}
+
+// WithDebugLog 启用调试日志
+func WithDebugLog(enabled bool) RemoteCacheOption {
+	return func(rc *RemoteCache) {
+		rc.debugLog = enabled
 	}
 }
 
@@ -173,6 +184,14 @@ func (rc *RemoteCache) NodeAddress() string {
 
 // doWithRetry 执行带重试逻辑的HTTP请求
 func (rc *RemoteCache) doWithRetry(method, url string, body, result interface{}) error {
+	if rc.debugLog {
+		log.Printf("DEBUG RemoteCache: Sending %s request to %s", method, url)
+		if body != nil {
+			bodyJSON, _ := json.Marshal(body)
+			log.Printf("DEBUG RemoteCache: Request body: %s", string(bodyJSON))
+		}
+	}
+
 	var lastErr error
 	for i := 0; i <= rc.retries; i++ {
 		err := rc.client.Do(method, url, body, result)
@@ -189,6 +208,10 @@ func (rc *RemoteCache) doWithRetry(method, url string, body, result interface{})
 
 		// 等待一段时间后重试
 		time.Sleep(rc.interval)
+	}
+
+	if lastErr != nil && rc.debugLog {
+		log.Printf("DEBUG RemoteCache: Response received successfully")
 	}
 
 	return lastErr
@@ -215,32 +238,59 @@ func (c *defaultHTTPClient) Do(method, url string, body, result interface{}) err
 		return fmt.Errorf("body required for POST method")
 	}
 
-	// 在实际项目中，这里会执行HTTP请求并处理响应
-	// 下面是模拟的空响应，实际实现中会替换为真实HTTP响应
-	emptyResponse := []byte("{}")
+	// 创建HTTP客户端
+	client := &http.Client{
+		Timeout: c.timeout,
+	}
+
+	var req *http.Request
+	var err error
+
+	// 准备请求体
+	if body != nil {
+		jsonData, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("failed to marshal request body: %w", err)
+		}
+
+		// 创建请求
+		req, err = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			return fmt.Errorf("failed to create request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+	} else {
+		// 无请求体的请求
+		req, err = http.NewRequest(method, url, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create request: %w", err)
+		}
+	}
+
+	// 发送请求
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 检查响应状态码
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned error status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
 
 	// 如果需要解析结果且提供了result参数
 	if result != nil {
-		// 检查 result 的类型，并根据类型进行不同的反序列化处理
-		resultValue := reflect.ValueOf(result)
-		if resultValue.Kind() != reflect.Ptr {
-			return fmt.Errorf("result must be a pointer")
+		// 读取响应体
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("failed to read response body: %w", err)
 		}
 
-		// 获取指针指向的实际类型
-		resultElem := resultValue.Elem()
-
-		// 针对不同的结果类型进行处理
-		switch resultElem.Kind() {
-		case reflect.Struct:
-			// 处理结构体
-			return json.Unmarshal(emptyResponse, result)
-		case reflect.Map:
-			// 处理 map
-			return json.Unmarshal(emptyResponse, result)
-		default:
-			// 其他类型
-			return fmt.Errorf("unsupported result type: %T", result)
+		// 解析响应
+		if err := json.Unmarshal(respBody, result); err != nil {
+			return fmt.Errorf("failed to unmarshal response: %w", err)
 		}
 	}
 

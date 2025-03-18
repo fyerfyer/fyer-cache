@@ -324,3 +324,13 @@ func (scc *ShardedClusterCache) AddNode(nodeID string, address string) error {
 func (scc *ShardedClusterCache) RemoveNode(nodeID string) error {
 	return scc.shardedCache.RemoveNode(nodeID)
 }
+
+// GetAddress 获取本地节点的地址
+func (scc *ShardedClusterCache) GetAddress() string {
+    return scc.address
+}
+
+// GetNodeID 获取本地节点的ID
+func (scc *ShardedClusterCache) GetNodeID() string {
+    return scc.localNodeID
+}
