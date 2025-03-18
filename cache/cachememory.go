@@ -296,3 +296,23 @@ func (lru *LRUEviction) Evict(c *MemCacheMemory) string {
 	lruKey := lru.accessList.tail.prev.key
 	return lruKey
 }
+
+// MemoryUsage 获取内存使用情况（字节）
+func (c *MemCacheMemory) MemoryUsage() int64 {
+	return atomic.LoadInt64(&c.usedMemory)
+}
+
+// ItemCount 获取缓存项目数量
+func (c *MemCacheMemory) ItemCount() int64 {
+	return int64(c.MemoryCache.data.Count())
+}
+
+// HitRate 获取缓存命中率
+func (c *MemCacheMemory) HitRate() float64 {
+	return c.MemoryCache.HitRate()
+}
+
+// MissRate 获取缓存未命中率
+func (c *MemCacheMemory) MissRate() float64 {
+	return c.MemoryCache.MissRate()
+}

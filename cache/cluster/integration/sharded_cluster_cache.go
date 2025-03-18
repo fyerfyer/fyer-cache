@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"github.com/fyerfyer/fyer-cache/cache/distributed"
 	"sync"
 	"time"
 
@@ -308,4 +309,18 @@ func (scc *ShardedClusterCache) Events() <-chan cache.ClusterEvent {
 // ReplicaFactor 获取当前的副本因子
 func (scc *ShardedClusterCache) ReplicaFactor() int {
 	return scc.shardedCache.ReplicaFactor()
+}
+
+// AddNode 添加缓存节点到集群
+func (scc *ShardedClusterCache) AddNode(nodeID string, address string) error {
+	// 创建远程缓存
+	remoteCache := distributed.NewRemoteCache(nodeID, address)
+
+	// 添加到分片缓存
+	return scc.shardedCache.AddNode(nodeID, remoteCache, 1)
+}
+
+// RemoveNode 从集群中移除节点
+func (scc *ShardedClusterCache) RemoveNode(nodeID string) error {
+	return scc.shardedCache.RemoveNode(nodeID)
 }
