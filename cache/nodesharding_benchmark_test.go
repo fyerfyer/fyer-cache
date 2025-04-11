@@ -8,152 +8,259 @@ import (
 	"time"
 )
 
-// 基准测试部分
+func setupShardedCache(b *testing.B, nodeCount int, virtualNodes int, replicaFactor int) *NodeShardedCache {
+	b.Helper()
+
+	var options []NodeShardedOption
+	if virtualNodes > 0 {
+		options = append(options, WithHashReplicas(virtualNodes))
+	}
+	if replicaFactor > 1 {
+		options = append(options, WithReplicaFactor(replicaFactor))
+	}
+
+	cache := NewNodeShardedCache(options...)
+
+	for i := 0; i < nodeCount; i++ {
+		nodeID := fmt.Sprintf("node-%d", i)
+		err := cache.AddNode(nodeID, NewMemoryCache(), 1)
+		if err != nil {
+			b.Fatalf("Failed to add node %s: %v", nodeID, err)
+		}
+	}
+
+	return cache
+}
+
+func populateCache(b *testing.B, cache *NodeShardedCache, itemCount int) {
+	b.Helper()
+	ctx := context.Background()
+
+	for i := 0; i < itemCount; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := generateRandomValue(100)
+		err := cache.Set(ctx, key, value, 10*time.Minute)
+		if err != nil {
+			b.Fatalf("Failed to populate cache: %v", err)
+		}
+	}
+}
 
 func BenchmarkNodeShardedCache_Get(b *testing.B) {
 	ctx := context.Background()
-
-	shardedCache := NewNodeShardedCache(WithHashReplicas(100))
-
-	// 添加5个节点
-	for i := 1; i <= 5; i++ {
-		nodeName := fmt.Sprintf("node%d", i)
-		err := shardedCache.AddNode(nodeName, NewMemoryCache(), 1)
-		if err != nil {
-			b.Fatalf("Failed to add %s: %v", nodeName, err)
-		}
-	}
-
-	// 预填充10K个键
-	for i := 0; i < 10000; i++ {
-		key := fmt.Sprintf("bench-key-%d", i)
-		err := shardedCache.Set(ctx, key, fmt.Sprintf("value-%d", i), time.Hour)
-		if err != nil {
-			b.Fatalf("Failed to set key: %v", err)
-		}
-	}
+	cache := setupShardedCache(b, 3, 100, 1)
+	populateCache(b, cache, 10000)
 
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		// 为每个goroutine创建随机源
-		r := rand.New(rand.NewSource(time.Now().UnixNano()))
-		for pb.Next() {
-			key := fmt.Sprintf("bench-key-%d", r.Intn(10000))
-			_, _ = shardedCache.Get(ctx, key)
-		}
-	})
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("key-%d", i%10000)
+		_, _ = cache.Get(ctx, key)
+	}
 }
 
 func BenchmarkNodeShardedCache_Set(b *testing.B) {
 	ctx := context.Background()
+	cache := setupShardedCache(b, 3, 100, 1)
 
-	shardedCache := NewNodeShardedCache(WithHashReplicas(100))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("bench-key-%d", i)
+		value := generateRandomValue(100)
+		_ = cache.Set(ctx, key, value, 10*time.Minute)
+	}
+}
 
-	// 添加5个节点
-	for i := 1; i <= 5; i++ {
-		nodeName := fmt.Sprintf("node%d", i)
-		err := shardedCache.AddNode(nodeName, NewMemoryCache(), 1)
-		if err != nil {
-			b.Fatalf("Failed to add %s: %v", nodeName, err)
-		}
+func BenchmarkNodeShardedCache_Del(b *testing.B) {
+	ctx := context.Background()
+	cache := setupShardedCache(b, 3, 100, 1)
+
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("del-key-%d", i)
+		_ = cache.Set(ctx, key, []byte("value"), 10*time.Minute)
 	}
 
 	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("del-key-%d", i)
+		_ = cache.Del(ctx, key)
+	}
+}
+
+func BenchmarkNodeShardedCache_Parallel(b *testing.B) {
+	ctx := context.Background()
+	cache := setupShardedCache(b, 3, 100, 1)
+
+	populateCache(b, cache, 10000)
+
+	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		// 为每个goroutine创建随机源和计数器
-		r := rand.New(rand.NewSource(time.Now().UnixNano()))
-		counter := 0
+		localRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+		i := 0
 		for pb.Next() {
-			key := fmt.Sprintf("bench-key-%d-%d", r.Intn(10000), counter)
-			value := fmt.Sprintf("value-%d", counter)
-			_ = shardedCache.Set(ctx, key, value, time.Hour)
-			counter++
+			key := fmt.Sprintf("key-%d", localRand.Intn(10000))
+			op := localRand.Intn(3)
+			switch op {
+			case 0:
+				_, _ = cache.Get(ctx, key)
+			case 1:
+				value := generateRandomValueWithRand(localRand, 100)
+				_ = cache.Set(ctx, key, value, 10*time.Minute)
+			case 2:
+				_ = cache.Del(ctx, key)
+			}
+			i++
 		}
 	})
 }
 
-func BenchmarkNodeShardedCache_ReplicaFactor(b *testing.B) {
-	ctx := context.Background()
+func BenchmarkNodeShardedCache_NodeCount(b *testing.B) {
+	nodeCounts := []int{1, 2, 4, 8, 16}
 
-	// 测试不同复制因子下的性能
-	for _, factor := range []int{1, 2, 3} {
-		b.Run(fmt.Sprintf("ReplicaFactor-%d", factor), func(b *testing.B) {
-			shardedCache := NewNodeShardedCache(
-				WithHashReplicas(100),
-				WithReplicaFactor(factor),
-			)
+	for _, nodeCount := range nodeCounts {
+		b.Run(fmt.Sprintf("Nodes-%d", nodeCount), func(b *testing.B) {
+			ctx := context.Background()
+			cache := setupShardedCache(b, nodeCount, 100, 1)
 
-			// 添加5个节点
-			for i := 1; i <= 5; i++ {
-				nodeName := fmt.Sprintf("node%d", i)
-				err := shardedCache.AddNode(nodeName, NewMemoryCache(), 1)
-				if err != nil {
-					b.Fatalf("Failed to add %s: %v", nodeName, err)
-				}
-			}
-
-			// 预填充数据
-			for i := 0; i < 1000; i++ {
-				key := fmt.Sprintf("bench-key-%d", i)
-				err := shardedCache.Set(ctx, key, fmt.Sprintf("value-%d", i), time.Hour)
-				if err != nil {
-					b.Fatalf("Failed to set key: %v", err)
-				}
-			}
+			populateCache(b, cache, 10000)
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				key := fmt.Sprintf("bench-key-%d", i%1000)
-				if i%10 < 8 { // 80% 读, 20% 写
-					_, _ = shardedCache.Get(ctx, key)
-				} else {
-					_ = shardedCache.Set(ctx, key, fmt.Sprintf("new-value-%d", i), time.Hour)
-				}
+				key := fmt.Sprintf("key-%d", i%10000)
+				_, _ = cache.Get(ctx, key)
 			}
 		})
 	}
 }
 
-func BenchmarkNodeShardedCache_NodeCount(b *testing.B) {
-	ctx := context.Background()
+func BenchmarkNodeShardedCache_VirtualNodes(b *testing.B) {
+	virtualNodeCounts := []int{10, 50, 100, 500, 1000}
 
-	// 测试不同节点数量下的性能
-	for _, nodeCount := range []int{3, 5, 10, 20} {
-		b.Run(fmt.Sprintf("NodeCount-%d", nodeCount), func(b *testing.B) {
-			shardedCache := NewNodeShardedCache(WithHashReplicas(100))
+	for _, vnodes := range virtualNodeCounts {
+		b.Run(fmt.Sprintf("VNodes-%d", vnodes), func(b *testing.B) {
+			ctx := context.Background()
+			cache := setupShardedCache(b, 3, vnodes, 1)
 
-			// 添加指定数量的节点
-			for i := 1; i <= nodeCount; i++ {
-				nodeName := fmt.Sprintf("node%d", i)
-				err := shardedCache.AddNode(nodeName, NewMemoryCache(), 1)
-				if err != nil {
-					b.Fatalf("Failed to add %s: %v", nodeName, err)
-				}
+			populateCache(b, cache, 10000)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				key := fmt.Sprintf("key-%d", i%10000)
+				_, _ = cache.Get(ctx, key)
+			}
+		})
+	}
+}
+
+func BenchmarkNodeShardedCache_ReplicaFactor(b *testing.B) {
+	replicaFactors := []int{1, 2, 3}
+
+	for _, rf := range replicaFactors {
+		b.Run(fmt.Sprintf("RF-%d", rf), func(b *testing.B) {
+			ctx := context.Background()
+			cache := setupShardedCache(b, 5, 100, rf)
+
+			populateCache(b, cache, 10000)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				key := fmt.Sprintf("key-%d", i%10000)
+				_, _ = cache.Get(ctx, key)
+			}
+		})
+	}
+}
+
+func BenchmarkNodeShardedCache_KeyDistribution(b *testing.B) {
+	patterns := []struct {
+		name      string
+		keyPrefix string
+	}{
+		{"Sequential", "seq-"},
+		{"UserIDs", "user-"},
+		{"Sessions", "sess-"},
+		{"MD5Hashes", "hash-"},
+		{"UUIDs", "uuid-"},
+	}
+
+	for _, pattern := range patterns {
+		b.Run(pattern.name, func(b *testing.B) {
+			ctx := context.Background()
+			cache := setupShardedCache(b, 3, 100, 1)
+
+			for i := 0; i < 10000; i++ {
+				key := fmt.Sprintf("%s%d", pattern.keyPrefix, i)
+				_ = cache.Set(ctx, key, []byte("value"), 10*time.Minute)
 			}
 
-			// 预填充数据
-			for i := 0; i < 1000; i++ {
-				key := fmt.Sprintf("bench-key-%d", i)
-				err := shardedCache.Set(ctx, key, fmt.Sprintf("value-%d", i), time.Hour)
-				if err != nil {
-					b.Fatalf("Failed to set key: %v", err)
-				}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				key := fmt.Sprintf("%s%d", pattern.keyPrefix, i%10000)
+				_, _ = cache.Get(ctx, key)
+			}
+		})
+	}
+}
+
+func BenchmarkNodeShardedCache_HotSpots(b *testing.B) {
+	hotKeyPercentages := []int{10, 50, 90}
+
+	for _, hotPct := range hotKeyPercentages {
+		b.Run(fmt.Sprintf("HotKeys-%d%%", hotPct), func(b *testing.B) {
+			ctx := context.Background()
+			cache := setupShardedCache(b, 3, 100, 1)
+
+			populateCache(b, cache, 10000)
+
+			for i := 0; i < 10; i++ {
+				key := fmt.Sprintf("hot-key-%d", i)
+				_ = cache.Set(ctx, key, []byte("hot-value"), 10*time.Minute)
 			}
 
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
-				r := rand.New(rand.NewSource(time.Now().UnixNano()))
-				counter := 0
+				localRand := rand.New(rand.NewSource(time.Now().UnixNano()))
 				for pb.Next() {
-					key := fmt.Sprintf("bench-key-%d", r.Intn(1000))
-					if r.Float32() < 0.8 { // 80% 读
-						_, _ = shardedCache.Get(ctx, key)
-					} else { // 20% 写
-						_ = shardedCache.Set(ctx, key, fmt.Sprintf("new-value-%d", counter), time.Hour)
-						counter++
+					useHotKey := localRand.Intn(100) < hotPct
+
+					var key string
+					if useHotKey {
+						hotKeyIndex := localRand.Intn(10)
+						key = fmt.Sprintf("hot-key-%d", hotKeyIndex)
+					} else {
+						coldKeyIndex := localRand.Intn(10000)
+						key = fmt.Sprintf("cold-key-%d", coldKeyIndex)
 					}
+
+					_, _ = cache.Get(ctx, key)
 				}
 			})
 		})
+	}
+}
+
+func BenchmarkNodeShardedCache_WeightedNodes(b *testing.B) {
+	ctx := context.Background()
+
+	cache := NewNodeShardedCache()
+
+	err := cache.AddNode("node1", NewMemoryCache(), 1)
+	if err != nil {
+		b.Fatalf("Failed to add node1: %v", err)
+	}
+	err = cache.AddNode("node2", NewMemoryCache(), 2)
+	if err != nil {
+		b.Fatalf("Failed to add node2: %v", err)
+	}
+	err = cache.AddNode("node3", NewMemoryCache(), 4)
+	if err != nil {
+		b.Fatalf("Failed to add node3: %v", err)
+	}
+
+	populateCache(b, cache, 10000)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("key-%d", i%10000)
+		_, _ = cache.Get(ctx, key)
 	}
 }

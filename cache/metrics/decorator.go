@@ -209,3 +209,10 @@ func (mc *MonitoredCache) Del(ctx context.Context, key string) error {
 func (mc *MonitoredCache) HitRate() float64 {
 	return mc.collector.HitRate()
 }
+
+// collectMemStatsOnce 只收集一次内存统计信息，用于测试
+func (mc *MonitoredCache) collectMemStatsOnce() {
+    var memStats runtime.MemStats
+    runtime.ReadMemStats(&memStats)
+    mc.collector.SetMemoryUsage(int64(memStats.Alloc))
+}
