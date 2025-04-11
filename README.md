@@ -2,7 +2,7 @@
 
 FyerCache 是一个高性能、分布式、可扩展的 Go 语言缓存系统，提供从单机内存缓存到复杂的分布式缓存集群的完整解决方案。
 
-**文档：** [https://fyerfyer.github.io/fyer-cache](https://fyerfyer.github.io/fyer-cache)
+**文档：** [fyer-cache文档](https://fyerfyer.github.io/fyer-cache)
 
 ## 功能特性
 
