@@ -315,7 +315,7 @@ func TestShardDistribution(t *testing.T) {
 	for i := 0; i < cache.data.count; i++ {
 		shard := cache.data.shards[i]
 		shard.mu.RLock()
-		shardCounts[i] = len(shard.items)
+		shardCounts[i] = shard.items.Len()
 		shard.mu.RUnlock()
 	}
 
