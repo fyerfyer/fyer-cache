@@ -10,6 +10,7 @@ type Cache interface {
 	Get(ctx context.Context, key string) (any, error)
 	Set(ctx context.Context, key string, val any, expiration time.Duration) error
 	Del(ctx context.Context, key string) error
+	GetRange(ctx context.Context, startKey string, endKey string, limit int) (map[string]any, error)
 }
 
 //=================== 一致性哈希相关接口 ===================

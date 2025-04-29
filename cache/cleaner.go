@@ -26,19 +26,19 @@ type CleanTask struct {
 // Cleaner 清理器结构
 // 负责异步清理过期的缓存项
 type Cleaner struct {
-	cache       *ShardedMap       // 要清理的分片缓存
-	taskQueue   chan CleanTask    // 任务队列
-	workerCount int               // 工作协程数量
-	interval    time.Duration     // 清理周期
-	stopChan    chan struct{}     // 停止信号
-	wg          sync.WaitGroup    // 用于等待所有worker完成
-	onEvict     func(string, any) // 淘汰回调
+	cache       *SkipShardedMap    // 修改为SkipShardedMap
+	taskQueue   chan CleanTask     // 任务队列
+	workerCount int                // 工作协程数量
+	interval    time.Duration      // 清理周期
+	stopChan    chan struct{}      // 停止信号
+	wg          sync.WaitGroup     // 用于等待所有worker完成
+	onEvict     func(string, any)  // 淘汰回调
 	running     bool              // 是否已启动
 	mu          sync.Mutex        // 保护running状态
 }
 
 // NewCleaner 创建清理器
-func NewCleaner(cache *ShardedMap, options ...CleanerOption) *Cleaner {
+func NewCleaner(cache *SkipShardedMap, options ...CleanerOption) *Cleaner {
 	cleaner := &Cleaner{
 		cache:       cache,
 		interval:    DefaultCleanerInterval,
@@ -173,44 +173,43 @@ func (c *Cleaner) scheduleCleanTasks() {
 
 // processTask 处理单个清理任务
 func (c *Cleaner) processTask(task CleanTask) {
-	// 使用 RangeShard 遍历指定分片的所有缓存项
-	c.cache.RangeShard(task.shardIndex, func(key string, value *cacheItem) bool {
-		// 检查是否过期
-		if !value.expiration.IsZero() && task.now.After(value.expiration) {
-			// 获取分片
-			shard := c.cache.shards[task.shardIndex]
+	now := task.now
+	shard := c.cache.shards[task.shardIndex]
 
-			// 锁定分片
-			shard.mu.Lock()
+	// 锁定分片进行读操作
+	shard.mu.RLock()
 
-			// 再次检查项目是否存在并且已过期
-			// 这是必要的，因为在获取锁的过程中可能已经被修改
-			if item, exists := shard.items[key]; exists && !item.expiration.IsZero() && task.now.After(item.expiration) {
-				// 删除过期项目
-				delete(shard.items, key)
-				// 更新计数
-				atomic.AddInt64(&c.cache.itemCount, -1)
+	// 创建要删除的键列表（避免在回调中持有锁）
+	var expiredKeys []string
+	var expiredItems []*cacheItem
 
-				// 解锁分片，以便后续操作
-				shard.mu.Unlock()
-
-				// 调用淘汰回调
-				if c.onEvict != nil {
-					c.onEvict(key, item.value)
-				}
-			} else {
-				shard.mu.Unlock()
-			}
+	// 使用跳表的 ForEach 方法遍历
+	shard.items.ForEach(func(key string, item *cacheItem) bool {
+		if !item.expiration.IsZero() && now.After(item.expiration) {
+			expiredKeys = append(expiredKeys, key)
+			expiredItems = append(expiredItems, item)
 		}
-
-		// 检查任务是否已取消
-		select {
-		case <-task.ctx.Done():
-			return false // 停止遍历
-		default:
-			return true // 继续遍历
-		}
+		return true
 	})
+
+	// 释放读锁
+	shard.mu.RUnlock()
+
+	// 现在删除已过期的项
+	for i, key := range expiredKeys {
+		// 获取写锁来删除
+		shard.mu.Lock()
+		deleted := shard.items.Delete(key)
+		if deleted {
+			atomic.AddInt64(&c.cache.itemCount, -1)
+		}
+		shard.mu.Unlock()
+
+		// 调用回调
+		if deleted && c.onEvict != nil {
+			c.onEvict(key, expiredItems[i].value)
+		}
+	}
 }
 
 // ScheduleManualClean 手动安排清理任务

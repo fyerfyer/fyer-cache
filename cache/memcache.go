@@ -12,10 +12,10 @@ var cleanupInterval = 2 * time.Minute
 
 // MemoryCache 内存缓存结构
 type MemoryCache struct {
-	data        *ShardedMap                 // 存储缓存数据，使用分片映射代替sync.Map
-	onEvict     func(key string, value any) // 当缓存项被移除时的回调函数
-	stopCleanUp chan struct{}               // 停止清理任务
-	cleaner     *Cleaner                    // 异步清理器
+	data        *SkipShardedMap              // 修改为使用基于跳表的分片映射
+	onEvict     func(key string, value any)  // 当缓存项被移除时的回调函数
+	stopCleanUp chan struct{}                // 停止清理任务
+	cleaner     *Cleaner                     // 异步清理器
 
 	// 新增的配置字段
 	shardCount      int           // 分片数量
@@ -23,7 +23,7 @@ type MemoryCache struct {
 	workerCount     int           // 工作协程数量
 	queueSize       int           // 任务队列大小
 	cleanupInterval time.Duration // 清理间隔
-	stats *StatsCollector         // 统计收集器
+	stats           *StatsCollector // 统计收集器
 }
 
 // cacheItem 缓存项结构
@@ -40,7 +40,7 @@ func NewMemoryCache(options ...Option) *MemoryCache {
 		workerCount:     runtime.NumCPU(),
 		queueSize:       DefaultQueueSize,
 		useAsyncCleanup: false,
-		stats: NewStatsCollector(),
+		stats:           NewStatsCollector(),
 		cleanupInterval: cleanupInterval, // 添加默认清理间隔字段
 	}
 
@@ -49,8 +49,8 @@ func NewMemoryCache(options ...Option) *MemoryCache {
 		opt(cache)
 	}
 
-	// 创建分片映射
-	cache.data = NewShardedMap(cache.shardCount)
+	// 创建基于跳表的分片映射
+	cache.data = NewSkipShardedMap(cache.shardCount)
 
 	// 初始化其他必要的资源
 	cache.stopCleanUp = make(chan struct{})
@@ -109,6 +109,37 @@ func (c *MemoryCache) Get(ctx context.Context, key string) (any, error) {
 
 	c.stats.RecordHit()
 	return item.value, nil
+}
+
+// GetRange 实现缓存接口的GetRange方法（范围查询）
+func (c *MemoryCache) GetRange(ctx context.Context, startKey string, endKey string, limit int) (map[string]any, error) {
+	now := time.Now()
+	results := make(map[string]any)
+	count := 0
+
+	// 使用SkipShardedMap的RangeKeys方法
+	c.data.RangeKeys(startKey, endKey, limit, func(key string, item *cacheItem) bool {
+		// 检查是否过期
+		if !item.expiration.IsZero() && now.After(item.expiration) {
+			// 异步删除过期项，避免在回调中长时间持有锁
+			go func(k string) {
+				c.data.Delete(k)
+				if c.onEvict != nil {
+					c.onEvict(k, item.value)
+				}
+			}(key)
+			return true
+		}
+
+		// 添加到结果集
+		results[key] = item.value
+		count++
+
+		// 如果达到限制，返回false停止遍历
+		return limit <= 0 || count < limit
+	})
+
+	return results, nil
 }
 
 // Del 实现缓存接口的Delete方法
@@ -184,7 +215,7 @@ func (c *MemoryCache) startSyncCleanupTimer(interval time.Duration) {
 func (c *MemoryCache) cleanUp() {
 	now := time.Now()
 
-	// 使用ShardedMap的Range方法遍历所有项
+	// 使用SkipShardedMap的Range方法遍历所有项
 	c.data.Range(func(key string, value *cacheItem) bool {
 		if !value.expiration.IsZero() && now.After(value.expiration) {
 			c.data.Delete(key)
